@@ -1,5 +1,5 @@
 ; ============================================================
-;  SPACE INVADERS (concept edition), 32-bit x86 Windows, pure NASM
+;  PROJECT INVADERS (concept edition), 32-bit x86 Windows, pure NASM
 ;
 ;  Graphics: a 384x256 32-bit DIB in memory, drawn pixel by pixel from
 ;  1-bit sprite rows (dw, MSB = leftmost pixel), shown with GDI
@@ -766,7 +766,10 @@ addebul:                        ; EBX=x ECX=y EDX=dx
     cmp dword [stage], 3
     jb .s
     inc edx
-.s: mov [eax+16], edx
+.s: cmp dword [rule], 3         ; SWIFT BOMBS
+    jne .t
+    add edx, 2
+.t: mov [eax+16], edx
 .r: popad
     ret
 
@@ -791,11 +794,14 @@ addpbul:                        ; EBX=x EDX=dx (starts just above the ship)
 .r: popad
     ret
 
-addscore:                       ; EAX = base points (doubled while Score x2 is active)
+addscore:                       ; EAX = base points (doubled by Score x2 and by the Bounty Hunt rule)
     cmp dword [t_x2], 0
     je .a
     add eax, eax
-.a: add [score], eax
+.a: cmp dword [rule], 7
+    jne .b
+    add eax, eax
+.b: add [score], eax
     ret
 
 ; ============================================================
@@ -1041,6 +1047,10 @@ newgame:
     mov dword [uon], 0
     mov dword [utimer], 900
     mov dword [wclear], 0
+    mov dword [heat], 0
+    mov dword [ohot], 0
+    mov dword [wcount], 1
+    mov dword [rule], -1        ; no rule on wave 1
     mov edi, inv
     mov ecx, 5
     xor eax, eax
@@ -1097,6 +1107,29 @@ initformation:
     mov dword [anim], 0
     mov dword [bon], 0
     mov dword [bflash], 0
+    mov dword [rbanner], 0
+    cmp dword [rule], 0         ; wave rules only start on wave 2
+    jl .norb
+    mov dword [rbanner], 150    ; announce this wave's rule
+.norb:
+    cmp dword [rule], 1         ; HEAVY ARMOR: one extra hit point each
+    jne .nar
+    mov ecx, 36
+    mov edi, ALIEN
+.ar:
+    inc byte [edi]
+    inc edi
+    dec ecx
+    jnz .ar
+.nar:
+    cmp dword [rule], 6         ; BUNKERS DOWN: no cover
+    jne .nbk
+    cld
+    mov edi, BUNK
+    mov ecx, 90
+    xor eax, eax
+    rep stosd
+.nbk:
     cmp dword [wave], 3
     jne .r
     mov dword [bon], 1          ; the boss comes on the third wave of every stage
@@ -1117,6 +1150,15 @@ nextwave:
     inc dword [stage]
     call initbunkers
 .same:
+    cmp dword [rule], 6         ; give the bunkers back after a bunker-less wave
+    jne .nb
+    call initbunkers
+.nb:
+    inc dword [wcount]          ; every wave gets the next rule in the list
+    mov eax, [wcount]
+    sub eax, 2                  ; wave 2 gets rule 0, wave 3 rule 1, ...
+    and eax, 7
+    mov [rule], eax
     call initformation
     ret
 
@@ -1133,6 +1175,10 @@ play_step:
     mov dword [menusel], 0
     ret
 .go:
+    cmp dword [rbanner], 0
+    je .nb
+    dec dword [rbanner]
+.nb:
     cmp dword [pdead], 0
     je .alive
     dec dword [pdead]
@@ -1181,19 +1227,39 @@ player_step:
     je .g
     dec dword [t_x2]
 .g:
+    cmp dword [heat], 0         ; cannon cooling (fast while locked out)
+    je .cooled
+    cmp dword [ohot], 0
+    jne .fastcool
+    test byte [frame], 1
+    jnz .cooled
+.fastcool:
+    dec dword [heat]
+    cmp dword [ohot], 0
+    je .cooled
+    cmp dword [heat], 25
+    jg .cooled
+    mov dword [ohot], 0
+.cooled:
     mov eax, 2
     cmp dword [t_speed], 0
     je .sp
     mov eax, 4
 .sp:
     mov dword [bank], 0
-    cmp byte [kdown+K_LEFT], 0
-    je .nl
+    movzx ebx, byte [kdown+K_LEFT]
+    movzx ecx, byte [kdown+K_RIGHT]
+    cmp dword [rule], 2         ; MIRROR CONTROLS
+    jne .nm
+    xchg ebx, ecx
+.nm:
+    test ebx, ebx
+    jz .nl
     sub [px], eax
     mov dword [bank], 1
 .nl:
-    cmp byte [kdown+K_RIGHT], 0
-    je .nr
+    test ecx, ecx
+    jz .nr
     add [px], eax
     mov dword [bank], 2
 .nr:
@@ -1221,6 +1287,8 @@ player_step:
 .nt:
     cmp dword [pcool], 0        ; fire
     jne .nofire
+    cmp dword [ohot], 0         ; overheated: the cannon is locked
+    jne .nofire
     cmp byte [kdown+K_SPACE], 0
     je .nofire
     mov ebx, [px]
@@ -1236,6 +1304,26 @@ player_step:
 .cd:
     mov dword [pcool], 14
     mov dword [flash], 6
+    mov eax, 12                 ; every shot adds heat
+    cmp dword [t_spread], 0
+    je .g1
+    mov eax, 18
+.g1:
+    cmp dword [rule], 4         ; COOLANT LEAK
+    jne .g2
+    add eax, eax
+.g2:
+    add [heat], eax
+    cmp dword [heat], 100
+    jl .nofire
+    mov dword [heat], 100
+    mov dword [ohot], 1
+    mov ebx, [px]
+    add ebx, 8
+    mov ecx, [py]
+    mov eax, 8
+    xor edi, edi
+    call burst
 .nofire:
     cmp byte [kpress+K_UP], 0   ; power-up slot selection
     je .nu
@@ -1428,6 +1516,10 @@ upd_formation:
     mov ecx, [stage]
     dec ecx
     sub eax, ecx
+    cmp dword [rule], 0         ; RAPID INVADERS
+    jne .nr0
+    sub eax, 2
+.nr0:
     cmp eax, 1
     jge .ok
     mov eax, 1
@@ -1576,7 +1668,11 @@ enemy_fire:
     cmp ecx, 16
     jge .n
     mov ecx, 16
-.n: xor edx, edx
+.n: cmp dword [rule], 5         ; BULLET STORM
+    jne .ns
+    shr ecx, 1
+.ns:
+    xor edx, edx
     div ecx
     test edx, edx
     jnz .r
@@ -1804,7 +1900,12 @@ alien_hit:                      ; EBP=row EDI=col
     xor edx, edx
     mov ecx, 100
     div ecx
-    cmp edx, 14
+    mov eax, 14                 ; drop chance in percent
+    cmp dword [rule], 7
+    jne .dc
+    mov eax, 30
+.dc:
+    cmp edx, eax
     jge .r
     mov ebx, [ah_x]
     mov ecx, [ah_y]
@@ -2032,6 +2133,7 @@ col_drops:
     jnz .l
 .r: ret
 
+
 ; ============================================================
 ;  Rendering
 ; ============================================================
@@ -2123,11 +2225,13 @@ draw_play:
     call draw_ufo
     call draw_drops
     call draw_ship
+    call draw_heat
     call draw_bullets
     call draw_parts
     call draw_expls
     call draw_shield
     call draw_hud
+    call draw_rule
     cmp dword [wclear], 0
     je .r
     mov esi, s_waveclear
@@ -2907,17 +3011,121 @@ draw_over:
     call drawmenu
     ret
 
+; ------------------------------------------------------------
+;  overheat gauge under the ship, and the wave rule banner
+; ------------------------------------------------------------
+draw_heat:
+    cmp dword [pdead], 0
+    jne .r
+    cmp dword [scene], 4
+    je .r
+    mov ebx, [px]
+    sub ebx, 4
+    mov ecx, [py]
+    add ecx, 19
+    mov edx, 24
+    mov esi, 2
+    mov eax, 0x1A2238
+    call fillrect
+    mov edx, [heat]
+    imul edx, edx, 24
+    mov eax, edx
+    xor edx, edx
+    mov ecx, 100
+    div ecx
+    mov edx, eax
+    mov ecx, [py]
+    add ecx, 19
+    mov eax, C_PBUL
+    cmp dword [heat], 60
+    jl .col
+    mov eax, C_EXPO
+    cmp dword [heat], 85
+    jl .col
+    mov eax, C_PRED
+.col:
+    cmp dword [ohot], 0
+    je .fill
+    mov eax, C_PRED
+    test byte [frame], 4
+    jz .fill
+    mov eax, C_PWHITE
+.fill:
+    test edx, edx
+    jz .txt
+    call fillrect
+.txt:
+    cmp dword [ohot], 0
+    je .r
+    test byte [frame], 8
+    jnz .r
+    mov esi, s_overheat
+    mov ebx, [px]
+    sub ebx, 12
+    mov ecx, [py]
+    sub ecx, 9
+    mov edx, 1
+    mov eax, C_PRED
+    call drawtext
+.r: ret
+
+draw_rule:
+    cmp dword [rule], 0         ; nothing to show on wave 1
+    jl .r
+    mov eax, [rule]
+    mov esi, [rule_names+eax*4]
+    mov ebx, 8
+    mov ecx, 22
+    mov edx, 1
+    mov eax, 0xB89AFF
+    call drawtext
+    cmp dword [rbanner], 0
+    je .r
+    mov ebx, 56
+    mov ecx, 80
+    mov edx, 272
+    mov esi, 58
+    call panel
+    mov eax, [wcount]
+    mov ecx, 2
+    call numstr
+    mov esi, s_wavelbl
+    mov ebx, 166
+    mov ecx, 88
+    mov edx, 2
+    mov eax, C_PBUL
+    call drawtext
+    mov esi, numbuf
+    mov ebx, 204
+    mov ecx, 88
+    mov edx, 2
+    mov eax, C_PBUL
+    call drawtext
+    mov eax, [rule]
+    mov esi, [rule_names+eax*4]
+    mov ecx, 104
+    mov edx, 2
+    mov eax, C_GOLD
+    call drawtextc
+    mov eax, [rule]
+    mov esi, [rule_desc+eax*4]
+    mov ecx, 124
+    mov edx, 1
+    mov eax, C_PWHITE
+    call drawtextc
+.r: ret
+
 ; ============================================================
 ;  Data
 ; ============================================================
 s_class     db 'InvadersGDI', 0
-s_wtitle    db 'SPACE INVADERS', 0
+s_wtitle    db 'PROJECT INVADERS', 0
 s_score     db 'SCORE', 0
 s_lives     db 'LIVES', 0
 s_stage     db 'STAGE', 0
 s_x2        db 'X2', 0
 s_gt        db '>', 0
-s_space     db 'SPACE', 0
+s_space     db 'PROJECT', 0
 s_invaders  db 'INVADERS', 0
 s_start     db 'START', 0
 s_options   db 'OPTIONS', 0
@@ -2938,6 +3146,27 @@ s_hints     db 'ARROWS MOVE  SPACE SHOOT  Z USE  UP 1-5 PICK  P PAUSE', 0
 stagestr    db '1-1', 0
 cntstr      db '0', 0
 numbuf      times 16 db 0
+
+s_overheat  db 'OVERHEAT', 0
+s_wavelbl   db 'WAVE', 0
+r0n db 'RAPID INVADERS', 0
+r0d db 'ENEMIES MARCH FASTER', 0
+r1n db 'HEAVY ARMOR', 0
+r1d db 'EVERY ENEMY TAKES ONE MORE HIT', 0
+r2n db 'MIRROR CONTROLS', 0
+r2d db 'LEFT AND RIGHT ARE SWAPPED', 0
+r3n db 'SWIFT BOMBS', 0
+r3d db 'ENEMY SHOTS FALL FASTER', 0
+r4n db 'COOLANT LEAK', 0
+r4d db 'THE CANNON HEATS UP TWICE AS FAST', 0
+r5n db 'BULLET STORM', 0
+r5d db 'ENEMIES SHOOT TWICE AS OFTEN', 0
+r6n db 'BUNKERS DOWN', 0
+r6d db 'NO COVER THIS WAVE', 0
+r7n db 'BOUNTY HUNT', 0
+r7d db 'DOUBLE POINTS AND MORE DROPS', 0
+rule_names  dd r0n, r1n, r2n, r3n, r4n, r5n, r6n, r7n
+rule_desc   dd r0d, r1d, r2d, r3d, r4d, r5d, r6d, r7d
 
 menu_items  dd s_start, s_options, s_quit
 pause_items dd s_resume, s_restart, s_quit
@@ -3051,6 +3280,11 @@ pn_x dd 0
 pn_y dd 0
 pn_w dd 0
 pn_h dd 0
+heat dd 0
+ohot dd 0
+wcount dd 1
+rule dd 0
+rbanner dd 0
 kdown times NK db 0
 kprev times NK db 0
 kpress times NK db 0
