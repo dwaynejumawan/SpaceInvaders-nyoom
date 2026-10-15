@@ -19,3 +19,5 @@ Download `invaders_gdi.exe` and double-click it (Windows only).
 Install [NASM](https://www.nasm.us/), then run:
 
     nasm -f bin invaders_gdi.asm -o invaders_gdi.exe
+
+    -- Hey Ethan Finished.
