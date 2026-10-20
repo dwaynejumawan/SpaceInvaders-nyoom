@@ -43,7 +43,23 @@ K_ESC equ 6
 K_Z equ 7
 K_P equ 8
 K_1 equ 9
-NK equ 14
+K_M equ 14
+K_BACK equ 15
+NK equ 16
+
+SNDBUF      equ 0x46B000        ; generated WAV effects (8-bit mono, 11025 Hz)
+NSFX        equ 11
+SFX_SHOOT   equ 0
+SFX_KILL    equ 1
+SFX_BOOM    equ 2
+SFX_PICK    equ 3
+SFX_USE     equ 4
+SFX_UFO     equ 5
+SFX_HEAT    equ 6
+SFX_WAVE    equ 7
+SFX_OVER    equ 8
+SFX_MENU    equ 9
+SFX_HIT     equ 10
 
 WSTYLE equ 0x00CA0000           ; caption, system menu, minimize box
 
@@ -101,7 +117,7 @@ section .hdr start=0 vstart=0
     dw 0, 0
     dw 4, 0
     dd 0
-    dd 0x71000                  ; SizeOfImage
+    dd 0x79000                  ; SizeOfImage
     dd 0x200
     dd 0
     dw 2                        ; subsystem: Windows GUI
@@ -116,7 +132,7 @@ section .hdr start=0 vstart=0
     times 14*8 db 0
 
     db '.text', 0, 0, 0
-    dd 0x70000                  ; VirtualSize: code+data (32 KB) then frame buffer and pools
+    dd 0x78000                  ; VirtualSize: code+data (32 KB) then frame buffer and pools
     dd 0x1000
     dd textsize
     dd 0x200
@@ -137,6 +153,11 @@ text_start:
 %macro KLIST 1
     %1 ExitProcess
     %1 Sleep
+    %1 CreateFileA
+    %1 ReadFile
+    %1 WriteFile
+    %1 CloseHandle
+    %1 GetModuleFileNameA
 %endmacro
 %macro ULIST 1
     %1 RegisterClassA
@@ -159,6 +180,7 @@ text_start:
 %macro MLIST 1
     %1 timeBeginPeriod
     %1 timeGetTime
+    %1 PlaySoundA
 %endmacro
 
 %macro hint 1
@@ -265,6 +287,9 @@ start:
     mov [nexttick], eax
     mov [seed], eax
     call initstars
+    call initsound
+    call initpath
+    call lb_load
     mov dword [scene], 0
 
 mainloop:
@@ -791,6 +816,10 @@ addpbul:                        ; EBX=x EDX=dx (starts just above the ship)
     mov [eax+8], ecx
     mov [eax+12], edx
     mov dword [eax+16], -5
+    xor edx, edx
+    cmp dword [t_spread], 0     ; remember shots fired under Spread Shot
+    setne dl
+    mov [eax+20], edx
 .r: popad
     ret
 
@@ -804,11 +833,349 @@ addscore:                       ; EAX = base points (doubled by Score x2 and by 
 .b: add [score], eax
     ret
 
+; ------------------------------------------------------------
+;  sound: effects are synthesised into WAV images at startup, played with PlaySound
+; ------------------------------------------------------------
+initsound:
+    pushad
+    mov dword [sc_ptr], SNDBUF
+    mov dword [sc_lfsr], 0x12345678
+    xor ebp, ebp
+.fx:
+    imul esi, ebp, 24
+    add esi, sfxtab
+    mov edi, [sc_ptr]
+    mov [sfxptr+ebp*4], edi
+    mov ecx, [esi]
+    mov [sc_n], ecx
+    mov dword [edi], 0x46464952         ; "RIFF"
+    lea eax, [ecx+36]
+    mov [edi+4], eax
+    mov dword [edi+8], 0x45564157       ; "WAVE"
+    mov dword [edi+12], 0x20746D66      ; "fmt "
+    mov dword [edi+16], 16
+    mov word [edi+20], 1                ; PCM
+    mov word [edi+22], 1                ; mono
+    mov dword [edi+24], 11025
+    mov dword [edi+28], 11025
+    mov word [edi+32], 1
+    mov word [edi+34], 8
+    mov dword [edi+36], 0x61746164      ; "data"
+    mov [edi+40], ecx
+    add edi, 44
+    xor ebx, ebx
+    mov dword [sc_phase], 0
+.s:
+    mov eax, [sc_n]                     ; volume decays linearly to silence
+    sub eax, ebx
+    imul eax, [esi+12]
+    xor edx, edx
+    div dword [sc_n]
+    mov [sc_amp], eax
+    mov eax, [esi+16]
+    cmp eax, 1
+    je .noise
+    mov edx, [esi+4]
+    cmp eax, 2
+    jne .sweep
+    mov ecx, [sc_n]
+    shr ecx, 1
+    cmp ebx, ecx
+    jb .fz
+    mov edx, [esi+8]
+    jmp .fz
+.sweep:
+    mov eax, [esi+8]
+    sub eax, [esi+4]
+    imul eax, ebx
+    cdq
+    idiv dword [sc_n]
+    add eax, [esi+4]
+    mov edx, eax
+.fz:
+    mov eax, edx
+    shl eax, 16
+    xor edx, edx
+    mov ecx, 11025
+    div ecx
+    add [sc_phase], eax
+    mov eax, [sc_phase]
+    and eax, 0xFFFF
+    cmp eax, 0x8000
+    mov eax, [sc_amp]
+    jb .pos
+    neg eax
+.pos:
+    add eax, 128
+    mov [edi], al
+    jmp .next
+.noise:
+    mov eax, ebx
+    xor edx, edx
+    div dword [esi+4]
+    test edx, edx
+    jnz .keep
+    mov eax, [sc_lfsr]
+    mov edx, eax
+    shl edx, 13
+    xor eax, edx
+    mov edx, eax
+    shr edx, 17
+    xor eax, edx
+    mov edx, eax
+    shl edx, 5
+    xor eax, edx
+    mov [sc_lfsr], eax
+.keep:
+    mov eax, [sc_lfsr]
+    test eax, 0x100
+    mov eax, [sc_amp]
+    jnz .p2
+    neg eax
+.p2:
+    add eax, 128
+    mov [edi], al
+.next:
+    inc edi
+    inc ebx
+    cmp ebx, [sc_n]
+    jb .s
+    mov [sc_ptr], edi
+    inc ebp
+    cmp ebp, NSFX
+    jb .fx
+    popad
+    ret
+
+playsfx:                        ; EAX = effect id; preserves every register
+    pushad
+    cmp dword [muted], 0
+    jne .r
+    mov ebp, eax
+    call [_timeGetTime]
+    cmp eax, [sndend]
+    jae .go
+    movzx edx, byte [sfxprio+ebp]
+    cmp edx, [sndprio]          ; a more important sound is still playing
+    jl .r
+.go:
+    push 7                      ; SND_MEMORY | SND_ASYNC | SND_NODEFAULT
+    push 0
+    push dword [sfxptr+ebp*4]
+    call [_PlaySoundA]
+    call [_timeGetTime]
+    add eax, [sfxdur+ebp*4]
+    mov [sndend], eax
+    movzx eax, byte [sfxprio+ebp]
+    mov [sndprio], eax
+.r: popad
+    ret
+
+; ------------------------------------------------------------
+
+; ------------------------------------------------------------
+;  name entry (scene 5) and score screen (scene 6)
+; ------------------------------------------------------------
+name_step:
+    cmp byte [kpress+K_ESC], 0
+    je .n1
+    mov dword [scene], 0
+    mov dword [menusel], 0
+    ret
+.n1:
+    cmp byte [kpress+K_BACK], 0
+    je .n2
+    cmp dword [pnlen], 0
+    jle .n2
+    dec dword [pnlen]
+.n2:
+    xor ebp, ebp                ; 0-9 then A-Z; the virtual-key code equals the ASCII code
+.k:
+    mov eax, ebp
+    cmp eax, 10
+    jb .dig
+    add eax, 0x41 - 10
+    jmp .vk
+.dig:
+    add eax, 0x30
+.vk:
+    mov ebx, eax
+    cmp dword [fg], 0
+    je .up
+    call isvk
+    jmp .have
+.up:
+    xor eax, eax
+.have:
+    mov edx, eax
+    movzx eax, byte [chprev+ebp]
+    mov [chprev+ebp], dl
+    test eax, eax
+    jnz .next
+    test edx, edx
+    jz .next
+    cmp dword [pnlen], 3
+    jge .next
+    mov eax, [pnlen]
+    mov [pname+eax], bl
+    inc dword [pnlen]
+.next:
+    inc ebp
+    cmp ebp, 36
+    jb .k
+    cmp byte [kpress+K_ENTER], 0
+    je .r
+    cmp dword [pnlen], 3
+    jl .r
+    call newgame
+    mov dword [scene], 2
+.r: ret
+
+score_step:
+    cmp byte [kpress+K_ESC], 0
+    jne .back
+    cmp byte [kpress+K_ENTER], 0
+    jne .back
+    cmp byte [kpress+K_SPACE], 0
+    je .r
+.back:
+    mov dword [scene], 0
+    mov dword [menusel], 1
+.r: ret
+
+; ------------------------------------------------------------
+;  leaderboard file: 5 entries of (3 name bytes, 0, score dword), next to the exe
+; ------------------------------------------------------------
+initpath:
+    pushad
+    push 260
+    push savepath
+    push 0
+    call [_GetModuleFileNameA]
+    lea edi, [savepath+eax]
+.b: dec edi
+    cmp edi, savepath
+    jbe .nodot
+    cmp byte [edi], '.'
+    jne .b
+    mov dword [edi+1], 0x00766173       ; "sav"
+    popad
+    ret
+.nodot:
+    mov dword [savepath], 'scor'        ; fall back to a relative file name
+    mov dword [savepath+4], 'es.s'
+    mov dword [savepath+8], 'av'
+    popad
+    ret
+
+lb_load:
+    pushad
+    push 0
+    push 0x80
+    push 3                      ; OPEN_EXISTING
+    push 0
+    push 1                      ; FILE_SHARE_READ
+    push 0x80000000             ; GENERIC_READ
+    push savepath
+    call [_CreateFileA]
+    cmp eax, -1
+    je .r
+    mov ebx, eax
+    push 0
+    push lbread
+    push 40
+    push lbtmp
+    push ebx
+    call [_ReadFile]
+    push ebx
+    call [_CloseHandle]
+    cmp dword [lbread], 40
+    jne .r
+    cld
+    mov esi, lbtmp
+    mov edi, lb
+    mov ecx, 10
+    rep movsd
+.r: popad
+    ret
+
+lb_save:
+    pushad
+    push 0
+    push 0x80
+    push 2                      ; CREATE_ALWAYS
+    push 0
+    push 0
+    push 0x40000000             ; GENERIC_WRITE
+    push savepath
+    call [_CreateFileA]
+    cmp eax, -1
+    je .r
+    mov ebx, eax
+    push 0
+    push lbread
+    push 40
+    push lb
+    push ebx
+    call [_WriteFile]
+    push ebx
+    call [_CloseHandle]
+.r: popad
+    ret
+
+lb_submit:                      ; insert the finished game's score into the top 5
+    pushad
+    mov dword [lb_rank], -1
+    mov eax, [score]
+    test eax, eax
+    jz .r
+    xor ebx, ebx
+.f: cmp ebx, 5
+    jae .r
+    cmp eax, [lb+ebx*8+4]
+    ja .ins
+    inc ebx
+    jmp .f
+.ins:
+    mov ecx, 4                  ; shift the lower entries down one place
+.sh:
+    cmp ecx, ebx
+    jbe .set
+    mov edx, [lb+ecx*8-8]
+    mov [lb+ecx*8], edx
+    mov edx, [lb+ecx*8-4]
+    mov [lb+ecx*8+4], edx
+    dec ecx
+    jmp .sh
+.set:
+    mov edx, [pname]
+    and edx, 0x00FFFFFF
+    mov [lb+ebx*8], edx
+    mov [lb+ebx*8+4], eax
+    mov [lb_rank], ebx
+    call lb_save
+.r: popad
+    ret
+
+; ------------------------------------------------------------
+
 ; ============================================================
 ;  Game logic
 ; ============================================================
 gamestep:
     inc dword [frame]
+    cmp dword [scene], 5        ; M is a letter while typing the name
+    je .nomute
+    cmp byte [kpress+K_M], 0    ; M toggles the sound
+    je .nomute
+    xor dword [muted], 1
+    cmp dword [muted], 0
+    je .nomute
+    push 0
+    push 0
+    push 0
+    call [_PlaySoundA]          ; stop whatever is playing
+.nomute:
     cmp dword [scene], 3
     je .skipbg
     call upd_bg
@@ -822,7 +1189,11 @@ gamestep:
     je play_step
     cmp eax, 3
     je pause_step
-    jmp over_step
+    cmp eax, 4
+    je over_step
+    cmp eax, 5
+    je name_step
+    jmp score_step
 
 initstars:
     xor ebp, ebp
@@ -908,6 +1279,8 @@ upd_bg:
 menu_nav:                       ; ECX = item count -> EAX = 1 when SPACE/ENTER pressed
     cmp byte [kpress+K_UP], 0
     je .nu
+    mov eax, SFX_MENU
+    call playsfx
     dec dword [menusel]
     jns .nu
     lea eax, [ecx-1]
@@ -915,6 +1288,8 @@ menu_nav:                       ; ECX = item count -> EAX = 1 when SPACE/ENTER p
 .nu:
     cmp byte [kpress+K_DOWN], 0
     je .nd
+    mov eax, SFX_MENU
+    call playsfx
     inc dword [menusel]
     cmp [menusel], ecx
     jb .nd
@@ -930,7 +1305,7 @@ menu_nav:                       ; ECX = item count -> EAX = 1 when SPACE/ENTER p
 .r: ret
 
 menu_step:
-    mov ecx, 3
+    mov ecx, 4
     call menu_nav
     test eax, eax
     jz .r
@@ -938,11 +1313,16 @@ menu_step:
     test eax, eax
     jz .start
     cmp eax, 1
+    je .scores
+    cmp eax, 2
     je .opt
     jmp quit
 .start:
-    call newgame
-    mov dword [scene], 2
+    mov dword [scene], 5        ; ask for a name first
+    ret
+.scores:
+    mov dword [lb_rank], -1
+    mov dword [scene], 6
     ret
 .opt:
     mov dword [scene], 1
@@ -984,7 +1364,7 @@ opt_step:
     jz .r
 .back:
     mov dword [scene], 0
-    mov dword [menusel], 1
+    mov dword [menusel], 2
 .r: ret
 
 pause_step:
@@ -1160,6 +1540,8 @@ nextwave:
     and eax, 7
     mov [rule], eax
     call initformation
+    mov eax, SFX_WAVE
+    call playsfx
     ret
 
 ; ------------------------------------------------------------
@@ -1183,6 +1565,9 @@ play_step:
     je .alive
     dec dword [pdead]
     jnz .world
+    call lb_submit
+    mov eax, SFX_OVER
+    call playsfx
     mov dword [scene], 4
     mov dword [menusel], 0
     ret
@@ -1304,6 +1689,8 @@ player_step:
 .cd:
     mov dword [pcool], 14
     mov dword [flash], 6
+    mov eax, SFX_SHOOT
+    call playsfx
     mov eax, 12                 ; every shot adds heat
     cmp dword [t_spread], 0
     je .g1
@@ -1318,6 +1705,8 @@ player_step:
     jl .nofire
     mov dword [heat], 100
     mov dword [ohot], 1
+    mov eax, SFX_HEAT
+    call playsfx
     mov ebx, [px]
     add ebx, 8
     mov ecx, [py]
@@ -1329,7 +1718,7 @@ player_step:
     je .nu
     mov eax, [sel]
     inc eax
-    cmp eax, 5
+    cmp eax, 3
     jb .su
     xor eax, eax
 .su:
@@ -1340,7 +1729,7 @@ player_step:
     mov eax, [sel]
     dec eax
     jns .sd
-    mov eax, 4
+    mov eax, 2
 .sd:
     mov [sel], eax
 .nd:
@@ -1350,7 +1739,7 @@ player_step:
     mov [sel], ecx
 .kn:
     inc ecx
-    cmp ecx, 5
+    cmp ecx, 3
     jb .k
     cmp byte [kpress+K_Z], 0    ; use the selected power-up
     je .done
@@ -1392,6 +1781,8 @@ player_step:
     mov eax, 10
     xor edi, edi
     call burst
+    mov eax, SFX_USE
+    call playsfx
 .done:
     ret
 
@@ -1737,6 +2128,8 @@ player_hit:
     cmp dword [t_shield], 0
     jne .absorb
     dec dword [lives]
+    mov eax, SFX_BOOM
+    call playsfx
     mov ebx, [px]
     add ebx, 8
     mov ecx, [py]
@@ -1880,6 +2273,8 @@ alien_hit:                      ; EBP=row EDI=col
     movzx edx, byte [coltype+edi]
     mov eax, [pts+edx*4]
     call addscore
+    mov eax, SFX_KILL
+    call playsfx
     imul ebx, edi, 22
     add ebx, [fx]
     add ebx, 8
@@ -1912,6 +2307,8 @@ alien_hit:                      ; EBP=row EDI=col
     call randdrop
 .r: ret
 .dmg:
+    mov eax, SFX_HIT
+    call playsfx
     imul ebx, edi, 22
     add ebx, [fx]
     add ebx, 8
@@ -1979,6 +2376,8 @@ pb_boss:
     cmp eax, 25
     jae .no
     mov dword [bflash], 4
+    mov eax, SFX_HIT
+    call playsfx
     mov ebx, [esi+4]
     mov ecx, [esi+8]
     mov eax, 5
@@ -1987,6 +2386,8 @@ pb_boss:
     dec dword [bhp]
     jg .hit
     mov dword [bon], 0          ; boss destroyed
+    mov eax, SFX_BOOM
+    call playsfx
     mov eax, 500
     call addscore
     mov ebx, [bossx]
@@ -2028,6 +2429,8 @@ pb_ufo:
     and eax, 0x1FF
     add eax, 900
     mov [utimer], eax
+    mov eax, SFX_UFO
+    call playsfx
     mov eax, [uval]
     call addscore
     mov ebx, [ux]
@@ -2050,9 +2453,12 @@ col_pbul:
     mov ecx, NPBUL
 .l: cmp dword [esi], 0
     je .n
+    cmp dword [esi+20], 0       ; scatter shots pass through the bunkers
+    jne .nobunk
     CALLSAVE pb_bunker
     test eax, eax
     jnz .kill
+.nobunk:
     CALLSAVE pb_aliens
     test eax, eax
     jnz .kill
@@ -2116,6 +2522,22 @@ col_drops:
     cmp eax, 32
     jae .n
     mov eax, [esi+20]
+    cmp eax, 3                  ; extra life: used at once
+    jne .notlife
+    cmp dword [lives], 5
+    jge .bonus
+    inc dword [lives]
+    jmp .full
+.bonus:
+    mov eax, 100                ; already at full lives: points instead
+    call addscore
+    jmp .full
+.notlife:
+    cmp eax, 4                  ; score x2: used at once
+    jne .store
+    mov dword [t_x2], 600
+    jmp .full
+.store:
     cmp dword [inv+eax*4], 9
     jge .full
     inc dword [inv+eax*4]
@@ -2127,6 +2549,8 @@ col_drops:
     mov eax, 6
     xor edi, edi
     call burst
+    mov eax, SFX_PICK
+    call playsfx
     pop ecx
 .n: add esi, 32
     dec ecx
@@ -2149,6 +2573,10 @@ render:
     jz draw_menu
     cmp eax, 1
     je draw_options
+    cmp eax, 5
+    je draw_name
+    cmp eax, 6
+    je draw_scores
     call draw_play
     mov eax, [scene]
     cmp eax, 3
@@ -2162,17 +2590,25 @@ draw_bg:
     mov ecx, [gy0]
     mov esi, galaxy_glow
     mov eax, 0x2A2060
+    shr eax, 1                  ; dim: about 50% opacity
+    and eax, 0x7F7F7F
     call blit16
     mov esi, galaxy_core
     mov eax, 0x7A55D8
+    shr eax, 1                  ; dim: about 50% opacity
+    and eax, 0x7F7F7F
     call blit16
     mov ebx, [gx1]
     mov ecx, [gy1]
     mov esi, galaxy_glow
     mov eax, 0x1E2A66
+    shr eax, 1                  ; dim: about 50% opacity
+    and eax, 0x7F7F7F
     call blit16
     mov esi, galaxy_core
     mov eax, 0x5577E0
+    shr eax, 1                  ; dim: about 50% opacity
+    and eax, 0x7F7F7F
     call blit16
     xor ebp, ebp
 .l:
@@ -2184,12 +2620,16 @@ draw_bg:
     cmp edx, 0
     jne .l1
     mov eax, 0x26324E
+    shr eax, 1                  ; dim: about 50% opacity
+    and eax, 0x7F7F7F
     call putpix
     jmp .n
 .l1:
     cmp edx, 1
     jne .l2
     mov eax, 0x7088C8
+    shr eax, 1                  ; dim: about 50% opacity
+    and eax, 0x7F7F7F
     call putpix
     jmp .n
 .l2:
@@ -2207,10 +2647,12 @@ draw_bg:
     sub ecx, 8
     mov esi, edi
     mov eax, 0x3C60C8
+    shr eax, 1                  ; dim: about 50% opacity
+    and eax, 0x7F7F7F
     call blit16
     pop ecx
     pop ebx
-    mov eax, C_PWHITE
+    mov eax, 0x4A5468           ; faint star centre
     call putpix
 .n: inc ebp
     cmp ebp, NSTAR
@@ -2442,6 +2884,19 @@ drawshipat:                     ; EBX=x ECX=y, uses [bank] and the chosen colour
     popad
     ret
 
+blit16h:                        ; ESI=data EAX=glow colour EBX=x ECX=y: sprite drawn on its four neighbours
+    inc ebx
+    call blit16
+    sub ebx, 2
+    call blit16
+    inc ebx
+    inc ecx
+    call blit16
+    sub ecx, 2
+    call blit16
+    inc ecx
+    ret
+
 draw_bullets:
     mov ebp, PBUL
     mov edi, NPBUL
@@ -2458,6 +2913,8 @@ draw_bullets:
     jl .sp
     mov esi, spread_r
 .sp:
+    mov eax, 0x0B4A5C
+    call blit16h
     mov eax, C_PUSPREAD
     call blit16
     jmp .pn
@@ -2467,7 +2924,17 @@ draw_bullets:
     and edx, 1
     shl edx, 5
     lea esi, [pbul0+edx]
+    mov eax, 0x174A7A           ; glow, then body, then white core
+    cmp dword [ebp+20], 0
+    je .h1
+    mov eax, 0x0B5A66
+.h1:
+    call blit16h
     mov eax, C_PBUL
+    cmp dword [ebp+20], 0
+    je .m1
+    mov eax, C_PUSPREAD         ; scatter shots are mint instead of blue
+.m1:
     call blit16
     lea esi, [pbul_core0+edx]
     mov eax, C_PWHITE
@@ -2489,7 +2956,12 @@ draw_bullets:
     and edx, 1
     shl edx, 5
     lea esi, [ebul0+edx]
+    mov eax, 0x6A1010
+    call blit16h
     mov eax, C_EBUL
+    call blit16
+    lea esi, [ebul_core0+edx]
+    mov eax, C_EXPY
     call blit16
 .en:
     add ebp, 32
@@ -2710,7 +3182,7 @@ draw_hud:
     xor ebp, ebp                ; power-up slots with counters
 .pu:
     imul ebx, ebp, 23
-    add ebx, 266
+    add ebx, 312
     mov ecx, 2
     mov eax, ebp
     call drawpu
@@ -2730,7 +3202,7 @@ draw_hud:
     cmp ebp, [sel]
     jne .pn
     imul ebx, ebp, 23
-    add ebx, 265
+    add ebx, 311
     mov eax, C_PWHITE
     mov ecx, 1
     mov edx, 22
@@ -2746,7 +3218,7 @@ draw_hud:
     call fillrect
 .pn:
     inc ebp
-    cmp ebp, 5
+    cmp ebp, 3
     jb .pu
     mov esi, s_hints
     mov ebx, 8
@@ -2860,8 +3332,8 @@ draw_menu:
     mov eax, C_PWHITE
     call drawtextc
     mov esi, menu_items
-    mov ecx, 3
-    mov ebx, 130
+    mov ecx, 4
+    mov ebx, 116
     call drawmenu
     mov ebx, 84                 ; the whole cast, animated
     mov ecx, 196
@@ -2979,14 +3451,121 @@ draw_pause:
     call drawmenu
     ret
 
+drawlb:                         ; ECX = first row y; draws the top 5, the new entry in gold
+    pushad
+    mov [lb_y], ecx
+    xor ebp, ebp
+.l: lea eax, [ebp+'1']
+    mov [lbrow], al
+    mov byte [lbrow+1], ' '
+    cmp dword [lb+ebp*8+4], 0
+    jne .real
+    mov dword [lbrow+2], '--- '
+    jmp .num
+.real:
+    mov al, [lb+ebp*8]
+    mov [lbrow+2], al
+    mov al, [lb+ebp*8+1]
+    mov [lbrow+3], al
+    mov al, [lb+ebp*8+2]
+    mov [lbrow+4], al
+    mov byte [lbrow+5], ' '
+.num:
+    mov eax, [lb+ebp*8+4]
+    mov ecx, 6
+    call numstr
+    cld
+    mov esi, numbuf
+    mov edi, lbrow+6
+    mov ecx, 7
+    rep movsb
+    mov esi, lbrow
+    mov ecx, [lb_y]
+    mov edx, 2
+    mov eax, 0xA8C8FF
+    cmp ebp, [lb_rank]
+    jne .c
+    mov eax, C_PUX2
+.c: call drawtextc
+    add dword [lb_y], 14
+    inc ebp
+    cmp ebp, 5
+    jb .l
+    popad
+    ret
+
+draw_name:
+    mov esi, s_entername
+    mov ecx, 50
+    mov edx, 3
+    mov eax, C_PWHITE
+    call drawtextc
+    xor ebp, ebp
+.b: imul ebx, ebp, 40
+    add ebx, 136
+    mov ecx, 100
+    mov edx, 32
+    mov esi, 44
+    call panel
+    cmp ebp, [pnlen]
+    jae .empty
+    mov al, [pname+ebp]
+    mov [chbuf], al
+    mov byte [chbuf+1], 0
+    mov esi, chbuf
+    add ebx, 10
+    mov ecx, 112
+    mov edx, 4
+    mov eax, C_PBUL
+    call drawtext
+    jmp .nx
+.empty:
+    jne .nx
+    test byte [frame], 16
+    jnz .nx
+    add ebx, 8
+    mov ecx, 134
+    mov edx, 16
+    mov esi, 3
+    mov eax, C_PUX2
+    call fillrect
+.nx:
+    inc ebp
+    cmp ebp, 3
+    jb .b
+    mov esi, s_nameh1
+    mov ecx, 164
+    mov edx, 1
+    mov eax, 0x6FA8FF
+    call drawtextc
+    mov esi, s_nameh2
+    mov ecx, 178
+    call drawtextc
+    ret
+
+draw_scores:
+    mov esi, s_leaderboard
+    mov ecx, 40
+    mov edx, 3
+    mov eax, C_PWHITE
+    call drawtextc
+    mov ecx, 92
+    call drawlb
+    mov esi, s_scoreback
+    mov ecx, 200
+    mov edx, 1
+    mov eax, 0x6FA8FF
+    call drawtextc
+    ret
+
 draw_over:
-    mov ebx, 96
-    mov ecx, 80
-    mov edx, 192
-    mov esi, 104
+    mov ebx, 88
+    mov ecx, 24
+    mov edx, 208
+    mov esi, 204
     call panel
     mov esi, s_gameover
-    mov ecx, 90
+    mov ecx, 32
     mov edx, 3
     mov eax, C_CRAB
     call drawtextc
@@ -2995,19 +3574,29 @@ draw_over:
     call numstr
     mov esi, s_final
     mov ebx, 122
-    mov ecx, 118
+    mov ecx, 62
     mov edx, 2
     mov eax, 0x6FA8FF
     call drawtext
     mov esi, numbuf
     mov ebx, 206
-    mov ecx, 118
+    mov ecx, 62
     mov edx, 2
     mov eax, C_PWHITE
     call drawtext
+    mov esi, s_top5
+    cmp dword [lb_rank], 0
+    jl .t
+    mov esi, s_newhi
+.t: mov ecx, 90
+    mov edx, 1
+    mov eax, C_PUX2
+    call drawtextc
+    mov ecx, 104
+    call drawlb
     mov esi, over_items
     mov ecx, 2
-    mov ebx, 144
+    mov ebx, 186
     call drawmenu
     ret
 
@@ -3142,7 +3731,7 @@ s_blue      db '< BLUE >', 0
 s_green     db '< GREEN >', 0
 s_purple    db '< PURPLE >', 0
 s_optkeys   db 'UP DOWN SELECT   LEFT RIGHT CHANGE   ESC BACK', 0
-s_hints     db 'ARROWS MOVE  SPACE SHOOT  Z USE  UP 1-5 PICK  P PAUSE', 0
+s_hints     db 'ARROWS MOVE  SPACE SHOOT  Z USE  1-3 PICK  P PAUSE  M MUTE', 0
 stagestr    db '1-1', 0
 cntstr      db '0', 0
 numbuf      times 16 db 0
@@ -3168,7 +3757,7 @@ r7d db 'DOUBLE POINTS AND MORE DROPS', 0
 rule_names  dd r0n, r1n, r2n, r3n, r4n, r5n, r6n, r7n
 rule_desc   dd r0d, r1d, r2d, r3d, r4d, r5d, r6d, r7d
 
-menu_items  dd s_start, s_options, s_quit
+menu_items  dd s_start, s_scores, s_options, s_quit
 pause_items dd s_resume, s_restart, s_quit
 over_items  dd s_restart, s_quit
 colnames    dd s_blue, s_green, s_purple
@@ -3184,7 +3773,7 @@ pu_col      dd C_PUSHIELD, C_PUSPEED, C_PUSPREAD, C_PULIFE, C_PUX2
 
 ; logical key -> two virtual-key codes (arrows or WASD, etc.)
 keymap      db 0x25,0x41, 0x27,0x44, 0x26,0x57, 0x28,0x53, 0x20,0, 0x0D,0, 0x1B,0, 0x5A,0
-            db 0x50,0, 0x31,0, 0x32,0, 0x33,0, 0x34,0, 0x35,0
+            db 0x50,0, 0x31,0, 0x32,0, 0x33,0, 0x34,0, 0x35,0, 0x4D,0, 0x08,0
 
 ; bunker template: 10 x 6 cells, 1 = block
 bunk_tpl    db 0,1,1,1,1,1,1,1,1,0
@@ -3201,6 +3790,50 @@ bmi         dd 40, W, -H
             dw 1, 32
             dd 0, 0, 0, 0, 0, 0
 msg         times 32 db 0
+
+sfxtab:                         ; samples, freq (noise: hold), freq 2, volume, kind, -
+    dd 1100, 1500, 500, 34, 0, 0
+    dd 1900, 3, 0, 48, 1, 0
+    dd 5500, 7, 0, 70, 1, 0
+    dd 2400, 900, 1400, 36, 2, 0
+    dd 3000, 300, 1100, 38, 0, 0
+    dd 3200, 1300, 700, 36, 2, 0
+    dd 3500, 220, 110, 40, 0, 0
+    dd 4200, 600, 900, 36, 2, 0
+    dd 7000, 500, 80, 44, 0, 0
+    dd 700, 900, 900, 26, 0, 0
+    dd 1200, 2, 0, 40, 1, 0
+sfxdur      dd 119, 192, 518, 237, 292, 310, 337, 400, 654, 83, 128
+sfxprio     db 1, 2, 4, 3, 3, 3, 3, 3, 5, 0, 2
+muted       dd 0
+sndend      dd 0
+sndprio     dd 0
+sc_ptr      dd 0
+sc_lfsr     dd 0
+sc_n        dd 0
+sc_phase    dd 0
+sc_amp      dd 0
+sfxptr      times NSFX dd 0
+s_scores    db 'SCORES', 0
+s_entername db 'ENTER NAME', 0
+s_nameh1    db 'TYPE 3 LETTERS OR DIGITS', 0
+s_nameh2    db 'BACKSPACE DELETE   ENTER START   ESC BACK', 0
+s_leaderboard db 'LEADERBOARD', 0
+s_scoreback db 'ENTER OR ESC BACK', 0
+s_top5      db 'TOP 5', 0
+s_newhi     db 'NEW HIGH SCORE', 0
+pname       db 0, 0, 0, 0
+pnlen       dd 0
+chprev      times 36 db 0
+chbuf       db 0, 0
+lbrow       times 16 db 0
+    align 4, db 0
+lb          times 10 dd 0
+lbtmp       times 10 dd 0
+lbread      dd 0
+lb_rank     dd -1
+lb_y        dd 0
+savepath    times 264 db 0
 
 hwnd dd 0
 hdc dd 0
@@ -3809,16 +4442,16 @@ pbul0:   ; player bullet frame 0
     dw 0x0000   ; ................
     dw 0x0180   ; .......##.......
     dw 0x03C0   ; ......####......
-    dw 0x03C0   ; ......####......
-    dw 0x03C0   ; ......####......
+    dw 0x07E0   ; .....######.....
+    dw 0x07E0   ; .....######.....
+    dw 0x07E0   ; .....######.....
+    dw 0x07E0   ; .....######.....
+    dw 0x07E0   ; .....######.....
+    dw 0x07E0   ; .....######.....
     dw 0x03C0   ; ......####......
     dw 0x03C0   ; ......####......
     dw 0x0180   ; .......##.......
     dw 0x0180   ; .......##.......
-    dw 0x0180   ; .......##.......
-    dw 0x0000   ; ................
-    dw 0x0000   ; ................
-    dw 0x0000   ; ................
     dw 0x0000   ; ................
     dw 0x0000   ; ................
     dw 0x0000   ; ................
@@ -3827,8 +4460,11 @@ pbul1:   ; player bullet frame 1
     dw 0x0000   ; ................
     dw 0x0180   ; .......##.......
     dw 0x03C0   ; ......####......
-    dw 0x03C0   ; ......####......
-    dw 0x03C0   ; ......####......
+    dw 0x07E0   ; .....######.....
+    dw 0x07E0   ; .....######.....
+    dw 0x07E0   ; .....######.....
+    dw 0x07E0   ; .....######.....
+    dw 0x07E0   ; .....######.....
     dw 0x03C0   ; ......####......
     dw 0x03C0   ; ......####......
     dw 0x0180   ; .......##.......
@@ -3836,38 +4472,35 @@ pbul1:   ; player bullet frame 1
     dw 0x0180   ; .......##.......
     dw 0x0000   ; ................
     dw 0x0000   ; ................
+pbul_core0:   ; player bullet core
     dw 0x0000   ; ................
     dw 0x0000   ; ................
     dw 0x0000   ; ................
-pbul_core0:
-    dw 0x0000   ; ................
-    dw 0x0000   ; ................
-    dw 0x0000   ; ................
-    dw 0x0100   ; .......#........
-    dw 0x0100   ; .......#........
-    dw 0x0100   ; .......#........
-    dw 0x0100   ; .......#........
-    dw 0x0100   ; .......#........
-    dw 0x0000   ; ................
+    dw 0x0180   ; .......##.......
+    dw 0x0180   ; .......##.......
+    dw 0x0180   ; .......##.......
+    dw 0x0180   ; .......##.......
+    dw 0x0180   ; .......##.......
+    dw 0x0180   ; .......##.......
+    dw 0x0180   ; .......##.......
     dw 0x0000   ; ................
     dw 0x0000   ; ................
     dw 0x0000   ; ................
     dw 0x0000   ; ................
     dw 0x0000   ; ................
     dw 0x0000   ; ................
-    dw 0x0000   ; ................
-pbul_core1:
-    dw 0x0000   ; ................
+pbul_core1:   ; player bullet core
     dw 0x0000   ; ................
     dw 0x0000   ; ................
     dw 0x0000   ; ................
-    dw 0x0080   ; ........#.......
-    dw 0x0080   ; ........#.......
-    dw 0x0080   ; ........#.......
-    dw 0x0080   ; ........#.......
-    dw 0x0080   ; ........#.......
     dw 0x0000   ; ................
-    dw 0x0000   ; ................
+    dw 0x0180   ; .......##.......
+    dw 0x0180   ; .......##.......
+    dw 0x0180   ; .......##.......
+    dw 0x0180   ; .......##.......
+    dw 0x0180   ; .......##.......
+    dw 0x0180   ; .......##.......
+    dw 0x0180   ; .......##.......
     dw 0x0000   ; ................
     dw 0x0000   ; ................
     dw 0x0000   ; ................
@@ -3879,12 +4512,12 @@ ebul0:   ; enemy bullet frame 0
     dw 0x0180   ; .......##.......
     dw 0x03C0   ; ......####......
     dw 0x03C0   ; ......####......
-    dw 0x03C0   ; ......####......
-    dw 0x03C0   ; ......####......
+    dw 0x07E0   ; .....######.....
+    dw 0x07E0   ; .....######.....
+    dw 0x07E0   ; .....######.....
+    dw 0x07E0   ; .....######.....
     dw 0x03C0   ; ......####......
     dw 0x0180   ; .......##.......
-    dw 0x0180   ; .......##.......
-    dw 0x0000   ; ................
     dw 0x0000   ; ................
     dw 0x0000   ; ................
     dw 0x0000   ; ................
@@ -3894,15 +4527,15 @@ ebul1:   ; enemy bullet frame 1
     dw 0x0000   ; ................
     dw 0x0000   ; ................
     dw 0x0180   ; .......##.......
+    dw 0x0180   ; .......##.......
     dw 0x03C0   ; ......####......
-    dw 0x03C0   ; ......####......
-    dw 0x03C0   ; ......####......
+    dw 0x07E0   ; .....######.....
+    dw 0x07E0   ; .....######.....
+    dw 0x07E0   ; .....######.....
+    dw 0x07E0   ; .....######.....
     dw 0x03C0   ; ......####......
     dw 0x03C0   ; ......####......
     dw 0x0180   ; .......##.......
-    dw 0x0180   ; .......##.......
-    dw 0x0180   ; .......##.......
-    dw 0x0000   ; ................
     dw 0x0000   ; ................
     dw 0x0000   ; ................
     dw 0x0000   ; ................
@@ -3910,34 +4543,68 @@ ebul1:   ; enemy bullet frame 1
 spread_l:   ; spread bullet leaning left
     dw 0x0000   ; ................
     dw 0x0000   ; ................
-    dw 0x0700   ; .....###........
-    dw 0x0700   ; .....###........
-    dw 0x0380   ; ......###.......
-    dw 0x0380   ; ......###.......
-    dw 0x01C0   ; .......###......
-    dw 0x01C0   ; .......###......
-    dw 0x00E0   ; ........###.....
-    dw 0x00E0   ; ........###.....
-    dw 0x0070   ; .........###....
-    dw 0x0070   ; .........###....
-    dw 0x0038   ; ..........###...
-    dw 0x0000   ; ................
+    dw 0x0F00   ; ....####........
+    dw 0x0F00   ; ....####........
+    dw 0x0780   ; .....####.......
+    dw 0x0780   ; .....####.......
+    dw 0x03C0   ; ......####......
+    dw 0x03C0   ; ......####......
+    dw 0x01E0   ; .......####.....
+    dw 0x01E0   ; .......####.....
+    dw 0x00F0   ; ........####....
+    dw 0x00F0   ; ........####....
+    dw 0x0078   ; .........####...
+    dw 0x0078   ; .........####...
     dw 0x0000   ; ................
     dw 0x0000   ; ................
 spread_r:   ; spread bullet leaning right
     dw 0x0000   ; ................
     dw 0x0000   ; ................
-    dw 0x0038   ; ..........###...
-    dw 0x0038   ; ..........###...
-    dw 0x0070   ; .........###....
-    dw 0x0070   ; .........###....
-    dw 0x00E0   ; ........###.....
-    dw 0x00E0   ; ........###.....
-    dw 0x01C0   ; .......###......
-    dw 0x01C0   ; .......###......
-    dw 0x0380   ; ......###.......
-    dw 0x0380   ; ......###.......
-    dw 0x0700   ; .....###........
+    dw 0x00F0   ; ........####....
+    dw 0x00F0   ; ........####....
+    dw 0x01E0   ; .......####.....
+    dw 0x01E0   ; .......####.....
+    dw 0x03C0   ; ......####......
+    dw 0x03C0   ; ......####......
+    dw 0x0780   ; .....####.......
+    dw 0x0780   ; .....####.......
+    dw 0x0F00   ; ....####........
+    dw 0x0F00   ; ....####........
+    dw 0x1E00   ; ...####.........
+    dw 0x1E00   ; ...####.........
+    dw 0x0000   ; ................
+    dw 0x0000   ; ................
+ebul_core0:   ; enemy bullet core
+    dw 0x0000   ; ................
+    dw 0x0000   ; ................
+    dw 0x0000   ; ................
+    dw 0x0000   ; ................
+    dw 0x0000   ; ................
+    dw 0x0180   ; .......##.......
+    dw 0x0180   ; .......##.......
+    dw 0x0180   ; .......##.......
+    dw 0x0180   ; .......##.......
+    dw 0x0000   ; ................
+    dw 0x0000   ; ................
+    dw 0x0000   ; ................
+    dw 0x0000   ; ................
+    dw 0x0000   ; ................
+    dw 0x0000   ; ................
+    dw 0x0000   ; ................
+ebul_core1:
+    dw 0x0000   ; ................
+    dw 0x0000   ; ................
+    dw 0x0000   ; ................
+    dw 0x0000   ; ................
+    dw 0x0000   ; ................
+    dw 0x0000   ; ................
+    dw 0x0180   ; .......##.......
+    dw 0x0180   ; .......##.......
+    dw 0x0180   ; .......##.......
+    dw 0x0180   ; .......##.......
+    dw 0x0000   ; ................
+    dw 0x0000   ; ................
+    dw 0x0000   ; ................
     dw 0x0000   ; ................
     dw 0x0000   ; ................
     dw 0x0000   ; ................
