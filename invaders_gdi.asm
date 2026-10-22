@@ -48,7 +48,8 @@ K_BACK equ 15
 NK equ 16
 
 SNDBUF      equ 0x46B000        ; generated WAV effects (8-bit mono, 11025 Hz)
-NSFX        equ 11
+NSFX        equ 12
+AUDBUF      equ 0x493000        ; 5 mixer buffers of 512 16-bit samples
 SFX_SHOOT   equ 0
 SFX_KILL    equ 1
 SFX_BOOM    equ 2
@@ -60,6 +61,7 @@ SFX_WAVE    equ 7
 SFX_OVER    equ 8
 SFX_MENU    equ 9
 SFX_HIT     equ 10
+SFX_ESHOOT  equ 11
 
 WSTYLE equ 0x00CA0000           ; caption, system menu, minimize box
 
@@ -97,7 +99,7 @@ section .hdr start=0 vstart=0
     dd 0x40
     db 'PE', 0, 0
     dw 0x014C
-    dw 1
+    dw 2
     dd 0
     dd 0, 0
     dw 224
@@ -117,7 +119,7 @@ section .hdr start=0 vstart=0
     dw 0, 0
     dw 4, 0
     dd 0
-    dd 0x79000                  ; SizeOfImage
+    dd 0x97000                  ; SizeOfImage
     dd 0x200
     dd 0
     dw 2                        ; subsystem: Windows GUI
@@ -129,16 +131,26 @@ section .hdr start=0 vstart=0
     dd 0, 0
     dd imp_dir - ImageBase
     dd imp_dir_end - imp_dir
-    times 14*8 db 0
+    dd rsrc_start - ImageBase, rsrc_data_end - rsrc_start   ; resources (icon)
+    times 13*8 db 0
 
     db '.text', 0, 0, 0
-    dd 0x78000                  ; VirtualSize: code+data (32 KB) then frame buffer and pools
+    dd 0x94000                  ; VirtualSize: code+data (32 KB), then frame buffer, pools and audio buffers
     dd 0x1000
     dd textsize
     dd 0x200
     dd 0, 0
     dw 0, 0
     dd 0xE0000020
+
+    db '.rsrc', 0, 0, 0
+    dd rsrc_data_end - rsrc_start
+    dd 0x95000
+    dd rsrc_end - rsrc_start
+    dd 0x200 + textsize
+    dd 0, 0
+    dw 0, 0
+    dd 0x40000040               ; initialised data, readable
 
     times 0x200 - ($ - $$) db 0
 
@@ -173,6 +185,7 @@ text_start:
     %1 GetForegroundWindow
     %1 AdjustWindowRect
     %1 LoadCursorA
+    %1 LoadIconA
 %endmacro
 %macro GLIST 1
     %1 StretchDIBits
@@ -180,7 +193,9 @@ text_start:
 %macro MLIST 1
     %1 timeBeginPeriod
     %1 timeGetTime
-    %1 PlaySoundA
+    %1 waveOutOpen
+    %1 waveOutPrepareHeader
+    %1 waveOutWrite
 %endmacro
 
 %macro hint 1
@@ -257,6 +272,10 @@ start:
     push 0
     call [_LoadCursorA]
     mov [wc+24], eax
+    push 1                      ; the icon resource (id 1) embedded in the exe
+    push ImageBase
+    call [_LoadIconA]
+    mov [wc+20], eax
     push wc
     call [_RegisterClassA]
     push 0
@@ -288,6 +307,7 @@ start:
     mov [seed], eax
     call initstars
     call initsound
+    call audio_init
     call initpath
     call lb_load
     mov dword [scene], 0
@@ -314,6 +334,7 @@ mainloop:
     call gamestep
     call render
     call present
+    call audio_pump
     mov ebx, [nexttick]         ; fixed 16 ms step (about 60 updates per second)
     add ebx, 16
     mov [nexttick], ebx
@@ -795,6 +816,14 @@ addebul:                        ; EBX=x ECX=y EDX=dx
     jne .t
     add edx, 2
 .t: mov [eax+16], edx
+    mov eax, [frame]            ; enemy shots have their own sound, at most one per 5 frames
+    sub eax, [eshot_t]
+    cmp eax, 5
+    jb .r
+    mov eax, [frame]
+    mov [eshot_t], eax
+    mov eax, SFX_ESHOOT
+    call playsfx
 .r: popad
     ret
 
@@ -834,7 +863,8 @@ addscore:                       ; EAX = base points (doubled by Score x2 and by 
     ret
 
 ; ------------------------------------------------------------
-;  sound: effects are synthesised into WAV images at startup, played with PlaySound
+;  audio: effects are synthesised at startup into 16-bit samples; a small software mixer
+;  (up to 8 effect voices plus a chiptune sequencer) streams them through waveOut
 ; ------------------------------------------------------------
 initsound:
     pushad
@@ -848,27 +878,13 @@ initsound:
     mov [sfxptr+ebp*4], edi
     mov ecx, [esi]
     mov [sc_n], ecx
-    mov dword [edi], 0x46464952         ; "RIFF"
-    lea eax, [ecx+36]
-    mov [edi+4], eax
-    mov dword [edi+8], 0x45564157       ; "WAVE"
-    mov dword [edi+12], 0x20746D66      ; "fmt "
-    mov dword [edi+16], 16
-    mov word [edi+20], 1                ; PCM
-    mov word [edi+22], 1                ; mono
-    mov dword [edi+24], 11025
-    mov dword [edi+28], 11025
-    mov word [edi+32], 1
-    mov word [edi+34], 8
-    mov dword [edi+36], 0x61746164      ; "data"
-    mov [edi+40], ecx
-    add edi, 44
     xor ebx, ebx
     mov dword [sc_phase], 0
 .s:
     mov eax, [sc_n]                     ; volume decays linearly to silence
     sub eax, ebx
     imul eax, [esi+12]
+    imul eax, eax, 110
     xor edx, edx
     div dword [sc_n]
     mov [sc_amp], eax
@@ -896,7 +912,7 @@ initsound:
     mov eax, edx
     shl eax, 16
     xor edx, edx
-    mov ecx, 11025
+    mov ecx, 22050
     div ecx
     add [sc_phase], eax
     mov eax, [sc_phase]
@@ -906,8 +922,7 @@ initsound:
     jb .pos
     neg eax
 .pos:
-    add eax, 128
-    mov [edi], al
+    mov [edi], ax
     jmp .next
 .noise:
     mov eax, ebx
@@ -933,46 +948,295 @@ initsound:
     jnz .p2
     neg eax
 .p2:
-    add eax, 128
-    mov [edi], al
+    mov [edi], ax
 .next:
-    inc edi
+    add edi, 2
     inc ebx
     cmp ebx, [sc_n]
     jb .s
     mov [sc_ptr], edi
+    mov [sfxend+ebp*4], edi
     inc ebp
     cmp ebp, NSFX
     jb .fx
     popad
     ret
 
-playsfx:                        ; EAX = effect id; preserves every register
+audio_init:                     ; open the wave device and queue five silent-ish buffers
     pushad
-    cmp dword [muted], 0
-    jne .r
-    mov ebp, eax
-    call [_timeGetTime]
-    cmp eax, [sndend]
-    jae .go
-    movzx edx, byte [sfxprio+ebp]
-    cmp edx, [sndprio]          ; a more important sound is still playing
-    jl .r
-.go:
-    push 7                      ; SND_MEMORY | SND_ASYNC | SND_NODEFAULT
     push 0
-    push dword [sfxptr+ebp*4]
-    call [_PlaySoundA]
-    call [_timeGetTime]
-    add eax, [sfxdur+ebp*4]
-    mov [sndend], eax
-    movzx eax, byte [sfxprio+ebp]
-    mov [sndprio], eax
+    push 0
+    push 0
+    push wfx
+    push -1                     ; WAVE_MAPPER
+    push aud_hwo
+    call [_waveOutOpen]
+    test eax, eax
+    jnz .r                      ; no audio device: the game simply runs silent
+    mov dword [aud_ok], 1
+    xor ebp, ebp
+.h: imul edi, ebp, 32
+    add edi, whdr
+    mov eax, ebp
+    shl eax, 10
+    add eax, AUDBUF
+    mov [edi], eax
+    mov dword [edi+4], 1024
+    push 32
+    push edi
+    push dword [aud_hwo]
+    call [_waveOutPrepareHeader]
+    call mix_fill
+    push 32
+    push edi
+    push dword [aud_hwo]
+    call [_waveOutWrite]
+    inc ebp
+    cmp ebp, 5
+    jb .h
 .r: popad
     ret
 
-; ------------------------------------------------------------
+audio_pump:                     ; once per frame: refill every buffer the device has finished with
+    cmp dword [aud_ok], 0
+    je .r
+    pushad
+    xor ebp, ebp
+.l: imul edi, ebp, 32
+    add edi, whdr
+    test dword [edi+16], 1      ; WHDR_DONE
+    jz .n
+    call mix_fill
+    push 32
+    push edi
+    push dword [aud_hwo]
+    call [_waveOutWrite]
+.n: inc ebp
+    cmp ebp, 5
+    jb .l
+    popad
+.r: ret
 
+playsfx:                        ; EAX = effect id; starts it on a free voice, preserves all registers
+    pushad
+    cmp dword [aud_ok], 0
+    je .r
+    mov ebp, eax
+    xor esi, esi
+.f: cmp dword [voice_ptr+esi*4], 0
+    je .use
+    inc esi
+    cmp esi, 8
+    jb .f
+    jmp .r
+.use:
+    mov eax, [sfxptr+ebp*4]
+    mov [voice_ptr+esi*4], eax
+    mov eax, [sfxend+ebp*4]
+    mov [voice_end+esi*4], eax
+.r: popad
+    ret
+
+seq_step_do:                    ; start the next sixteenth of the current track
+    pushad
+    mov eax, [trk]
+    mov esi, [trkptr+eax*4]
+    mov eax, [esi]
+    mov [seq_samp], eax
+    mov ebx, [seq_step]
+    movzx eax, byte [esi+4+ebx]         ; lead: 0 = keep, 1 = cut, else note
+    cmp eax, 2
+    jb .l01
+    mov eax, [notetab+eax*4-144]
+    mov [lead_inc], eax
+    mov dword [lead_env], 0x7000
+    jmp .bass
+.l01:
+    test eax, eax
+    jz .bass
+    mov dword [lead_env], 0
+.bass:
+    movzx eax, byte [esi+68+ebx]        ; bass: 0 = keep, 1 = silence, else note
+    cmp eax, 2
+    jb .b01
+    mov eax, [notetab+eax*4-144]
+    mov [bass_inc], eax
+    jmp .drum
+.b01:
+    test eax, eax
+    jz .drum
+    mov dword [bass_inc], 0
+.drum:
+    movzx eax, byte [esi+132+ebx]       ; drums: 1 kick, 2 snare, 3 hat
+    test eax, eax
+    jz .adv
+    mov edx, [drumlen+eax*4]
+    mov [drum_rem], edx
+    mov [drum_len], edx
+    mov dword [drum_cnt], 1
+    mov edx, [drumhold+eax*4]
+    mov [drum_hold], edx
+    mov edx, [drumamp+eax*4]
+    mov [drum_amp], edx
+.adv:
+    inc ebx
+    and ebx, 63
+    mov [seq_step], ebx
+    popad
+    ret
+
+mix_fill:                       ; EDI = WAVEHDR: fill its buffer with 512 mixed samples
+    pushad
+    mov ebp, [edi]
+    xor eax, eax                ; music: 0 = menu theme, 1 = battle theme, -1 = none
+    mov edx, [scene]
+    cmp edx, 2
+    je .game
+    cmp edx, 3
+    je .game
+    cmp edx, 4
+    je .none
+    cmp edx, 1
+    jne .pick
+    cmp dword [opt_ret], 3
+    jne .pick
+.game:
+    mov eax, 1
+    jmp .pick
+.none:
+    mov eax, -1
+.pick:
+    cmp eax, [trk]
+    je .same
+    mov [trk], eax
+    mov dword [seq_samp], 0
+    mov dword [seq_step], 0
+    mov dword [drum_rem], 0
+    mov dword [lead_inc], 0
+    mov dword [bass_inc], 0
+    mov dword [lead_env], 0
+.same:
+    mov eax, [vol_music]
+    imul eax, eax, 26
+    mov [mgain], eax
+    mov eax, [vol_sfx]
+    imul eax, eax, 26
+    mov [sgain], eax
+    cmp dword [muted], 0
+    je .go
+    mov dword [mgain], 0
+    mov dword [sgain], 0
+.go:
+    mov ecx, 512
+.s: xor ebx, ebx
+    cmp dword [trk], 0
+    jl .sfx
+    dec dword [seq_samp]
+    jg .syn
+    call seq_step_do
+.syn:
+    mov eax, [lead_inc]         ; lead: 25% pulse with a decaying envelope
+    test eax, eax
+    jz .nl
+    add [lead_ph], eax
+    mov edx, [lead_env]
+    shr edx, 3
+    test dword [lead_ph], 0xC000
+    jz .lp
+    neg edx
+.lp:
+    add ebx, edx
+.nl:
+    mov eax, [lead_env]
+    sub eax, 3
+    jns .le
+    xor eax, eax
+.le:
+    mov [lead_env], eax
+    mov eax, [bass_inc]         ; bass: triangle
+    test eax, eax
+    jz .nb
+    add [bass_ph], eax
+    mov eax, [bass_ph]
+    and eax, 0xFFFF
+    cmp eax, 0x8000
+    jb .tr
+    not eax
+    and eax, 0xFFFF
+.tr:
+    sub eax, 0x4000
+    sar eax, 2
+    add ebx, eax
+.nb:
+    mov eax, [drum_rem]         ; drums: decaying noise
+    test eax, eax
+    jle .nd
+    dec dword [drum_rem]
+    dec dword [drum_cnt]
+    jg .dk
+    mov edx, [drum_hold]
+    mov [drum_cnt], edx
+    mov edx, [lfsr]
+    mov esi, edx
+    shl esi, 13
+    xor edx, esi
+    mov esi, edx
+    shr esi, 17
+    xor edx, esi
+    mov esi, edx
+    shl esi, 5
+    xor edx, esi
+    mov [lfsr], edx
+.dk:
+    mov eax, [drum_amp]
+    imul eax, [drum_rem]
+    cdq
+    idiv dword [drum_len]
+    test dword [lfsr], 0x100
+    jnz .dp
+    neg eax
+.dp:
+    add ebx, eax
+.nd:
+    imul ebx, [mgain]
+    sar ebx, 8
+.sfx:
+    xor edx, edx                ; sound effects: sum every active voice
+    xor esi, esi
+.v: mov eax, [voice_ptr+esi]
+    test eax, eax
+    jz .vn
+    movsx edi, word [eax]
+    add edx, edi
+    add eax, 2
+    cmp eax, [voice_end+esi]
+    jb .vk
+    xor eax, eax
+.vk:
+    mov [voice_ptr+esi], eax
+.vn:
+    add esi, 4
+    cmp esi, 32
+    jb .v
+    imul edx, [sgain]
+    sar edx, 8
+    add ebx, edx
+    cmp ebx, 32767
+    jle .c1
+    mov ebx, 32767
+.c1:
+    cmp ebx, -32768
+    jge .c2
+    mov ebx, -32768
+.c2:
+    mov [ebp], bx
+    add ebp, 2
+    dec ecx
+    jnz .s
+    popad
+    ret
+
+; ------------------------------------------------------------
 ; ------------------------------------------------------------
 ;  name entry (scene 5) and score screen (scene 6)
 ; ------------------------------------------------------------
@@ -1169,12 +1433,6 @@ gamestep:
     cmp byte [kpress+K_M], 0    ; M toggles the sound
     je .nomute
     xor dword [muted], 1
-    cmp dword [muted], 0
-    je .nomute
-    push 0
-    push 0
-    push 0
-    call [_PlaySoundA]          ; stop whatever is playing
 .nomute:
     cmp dword [scene], 3
     je .skipbg
@@ -1325,6 +1583,7 @@ menu_step:
     mov dword [scene], 6
     ret
 .opt:
+    mov dword [opt_ret], 0
     mov dword [scene], 1
     mov dword [menusel], 0
 .r: ret
@@ -1332,11 +1591,24 @@ menu_step:
 opt_step:
     cmp byte [kpress+K_ESC], 0
     jne .back
-    mov ecx, 2
+    mov ecx, 4
     call menu_nav
-    mov edx, eax
-    cmp dword [menusel], 0
-    jne .item1
+    mov edx, eax                ; activated (SPACE / ENTER)
+    mov eax, [menusel]
+    test eax, eax
+    jz .ship
+    cmp eax, 1
+    je .music
+    cmp eax, 2
+    je .sfx
+    test edx, edx               ; BACK
+    jz .r
+.back:
+    mov eax, [opt_ret]
+    mov [scene], eax
+    mov dword [menusel], 2      ; OPTIONS is the third item of both the main and pause menus
+    ret
+.ship:
     cmp byte [kpress+K_LEFT], 0
     je .nl
     mov eax, [shipcol]
@@ -1359,12 +1631,34 @@ opt_step:
 .sr:
     mov [shipcol], eax
     ret
-.item1:
-    test edx, edx
+.music:
+    mov esi, vol_music
+    call volchg
+    ret
+.sfx:
+    mov esi, vol_sfx
+    call volchg
+    test ebx, ebx
     jz .r
-.back:
-    mov dword [scene], 0
-    mov dword [menusel], 2
+    mov eax, SFX_PICK           ; so the new level can be heard
+    call playsfx
+.r: ret
+
+volchg:                         ; ESI = volume variable (0-10); LEFT / RIGHT adjust it; EBX = 1 if changed
+    xor ebx, ebx
+    cmp byte [kpress+K_LEFT], 0
+    je .nl
+    cmp dword [esi], 0
+    jle .nl
+    dec dword [esi]
+    mov ebx, 1
+.nl:
+    cmp byte [kpress+K_RIGHT], 0
+    je .r
+    cmp dword [esi], 10
+    jge .r
+    inc dword [esi]
+    mov ebx, 1
 .r: ret
 
 pause_step:
@@ -1372,7 +1666,7 @@ pause_step:
     jne .resume
     cmp byte [kpress+K_ESC], 0
     jne .resume
-    mov ecx, 3
+    mov ecx, 5
     call menu_nav
     test eax, eax
     jz .r
@@ -1381,22 +1675,44 @@ pause_step:
     jz .resume
     cmp eax, 1
     je .restart
+    cmp eax, 2
+    je .opt
+    cmp eax, 3
+    je .menu
     jmp quit
 .restart:
     call newgame
 .resume:
     mov dword [scene], 2
 .r: ret
+.opt:
+    mov dword [opt_ret], 3      ; settings, then back to the pause menu
+    mov dword [scene], 1
+    mov dword [menusel], 0
+    ret
+.menu:
+    mov dword [scene], 0
+    mov dword [menusel], 0
+    ret
 
 over_step:
-    mov ecx, 2
+    mov ecx, 3
     call menu_nav
     test eax, eax
     jz .r
-    cmp dword [menusel], 0
-    jne quit
+    mov eax, [menusel]
+    test eax, eax
+    jz .restart
+    cmp eax, 1
+    je .menu
+    jmp quit
+.restart:
     call newgame
     mov dword [scene], 2
+    ret
+.menu:
+    mov dword [scene], 0
+    mov dword [menusel], 0
 .r: ret
 
 ; ------------------------------------------------------------
@@ -3391,12 +3707,12 @@ draw_menu:
 
 draw_options:
     mov esi, s_options
-    mov ecx, 46
+    mov ecx, 22
     mov edx, 4
     mov eax, C_PWHITE
     call drawtextc
     mov esi, s_shipcolor
-    mov ecx, 108
+    mov ecx, 64
     mov edx, 2
     mov eax, 0x4A6FB5
     cmp dword [menusel], 0
@@ -3405,7 +3721,7 @@ draw_options:
 .a: call drawtextc
     mov eax, [shipcol]
     mov esi, [colnames+eax*4]
-    mov ecx, 128
+    mov ecx, 82
     mov edx, 2
     mov eax, [shipcol]
     mov eax, [shipcols+eax*4]
@@ -3416,14 +3732,36 @@ draw_options:
     mov ecx, [bankseq+eax*4]
     mov [bank], ecx
     mov ebx, 184
-    mov ecx, 152
+    mov ecx, 100
     call drawshipat
     mov dword [bank], 0
-    mov esi, s_back
-    mov ecx, 196
+    mov esi, s_music
+    mov ecx, 126
     mov edx, 2
     mov eax, 0x4A6FB5
     cmp dword [menusel], 1
+    jne .m
+    mov eax, C_PWHITE
+.m: call drawtextc
+    mov edi, [vol_music]
+    mov ecx, 144
+    call drawbar
+    mov esi, s_sfxvol
+    mov ecx, 164
+    mov edx, 2
+    mov eax, 0x4A6FB5
+    cmp dword [menusel], 2
+    jne .e
+    mov eax, C_PWHITE
+.e: call drawtextc
+    mov edi, [vol_sfx]
+    mov ecx, 182
+    call drawbar
+    mov esi, s_back
+    mov ecx, 208
+    mov edx, 2
+    mov eax, 0x4A6FB5
+    cmp dword [menusel], 3
     jne .b
     mov eax, C_PWHITE
 .b: call drawtextc
@@ -3434,20 +3772,38 @@ draw_options:
     call drawtextc
     ret
 
+drawbar:                        ; ECX = y, EDI = level 0-10: ten blocks, filled ones in blue
+    pushad
+    xor ebp, ebp
+.l: imul ebx, ebp, 14
+    add ebx, 124
+    mov edx, 10
+    mov esi, 8
+    mov eax, 0x1E2E52
+    cmp ebp, edi
+    jae .e
+    mov eax, C_PBUL
+.e: call fillrect
+    inc ebp
+    cmp ebp, 10
+    jb .l
+    popad
+    ret
+
 draw_pause:
     mov ebx, 112
-    mov ecx, 84
+    mov ecx, 54
     mov edx, 160
-    mov esi, 96
+    mov esi, 152
     call panel
     mov esi, s_paused
-    mov ecx, 94
+    mov ecx, 62
     mov edx, 3
     mov eax, C_PWHITE
     call drawtextc
     mov esi, pause_items
-    mov ecx, 3
-    mov ebx, 126
+    mov ecx, 5
+    mov ebx, 98
     call drawmenu
     ret
 
@@ -3560,12 +3916,12 @@ draw_scores:
 
 draw_over:
     mov ebx, 88
-    mov ecx, 24
+    mov ecx, 12
     mov edx, 208
-    mov esi, 204
+    mov esi, 222
     call panel
     mov esi, s_gameover
-    mov ecx, 32
+    mov ecx, 20
     mov edx, 3
     mov eax, C_CRAB
     call drawtextc
@@ -3574,13 +3930,13 @@ draw_over:
     call numstr
     mov esi, s_final
     mov ebx, 122
-    mov ecx, 62
+    mov ecx, 50
     mov edx, 2
     mov eax, 0x6FA8FF
     call drawtext
     mov esi, numbuf
     mov ebx, 206
-    mov ecx, 62
+    mov ecx, 50
     mov edx, 2
     mov eax, C_PWHITE
     call drawtext
@@ -3588,15 +3944,15 @@ draw_over:
     cmp dword [lb_rank], 0
     jl .t
     mov esi, s_newhi
-.t: mov ecx, 90
+.t: mov ecx, 76
     mov edx, 1
     mov eax, C_PUX2
     call drawtextc
-    mov ecx, 104
+    mov ecx, 88
     call drawlb
     mov esi, over_items
-    mov ecx, 2
-    mov ebx, 186
+    mov ecx, 3
+    mov ebx, 172
     call drawmenu
     ret
 
@@ -3758,8 +4114,8 @@ rule_names  dd r0n, r1n, r2n, r3n, r4n, r5n, r6n, r7n
 rule_desc   dd r0d, r1d, r2d, r3d, r4d, r5d, r6d, r7d
 
 menu_items  dd s_start, s_scores, s_options, s_quit
-pause_items dd s_resume, s_restart, s_quit
-over_items  dd s_restart, s_quit
+pause_items dd s_resume, s_restart, s_options, s_menu, s_quit
+over_items  dd s_restart, s_menu, s_quit
 colnames    dd s_blue, s_green, s_purple
 shipcols    dd C_PBLUE, C_SQUID, C_OCTO
 bankseq     dd 0, 1, 0, 2
@@ -3791,30 +4147,92 @@ bmi         dd 40, W, -H
             dd 0, 0, 0, 0, 0, 0
 msg         times 32 db 0
 
-sfxtab:                         ; samples, freq (noise: hold), freq 2, volume, kind, -
-    dd 1100, 1500, 500, 34, 0, 0
-    dd 1900, 3, 0, 48, 1, 0
-    dd 5500, 7, 0, 70, 1, 0
-    dd 2400, 900, 1400, 36, 2, 0
-    dd 3000, 300, 1100, 38, 0, 0
-    dd 3200, 1300, 700, 36, 2, 0
-    dd 3500, 220, 110, 40, 0, 0
-    dd 4200, 600, 900, 36, 2, 0
-    dd 7000, 500, 80, 44, 0, 0
-    dd 700, 900, 900, 26, 0, 0
-    dd 1200, 2, 0, 40, 1, 0
-sfxdur      dd 119, 192, 518, 237, 292, 310, 337, 400, 654, 83, 128
-sfxprio     db 1, 2, 4, 3, 3, 3, 3, 3, 5, 0, 2
+sfxtab:                         ; samples (22050 Hz), freq (noise: hold), freq 2, volume, kind, -
+    dd 1984, 1700, 600, 30, 0, 0
+    dd 3748, 6, 0, 48, 1, 0
+    dd 9922, 14, 0, 70, 1, 0
+    dd 4410, 900, 1400, 36, 2, 0
+    dd 5512, 300, 1100, 38, 0, 0
+    dd 5733, 1300, 700, 36, 2, 0
+    dd 6615, 220, 110, 40, 0, 0
+    dd 7717, 600, 900, 36, 2, 0
+    dd 13230, 500, 80, 44, 0, 0
+    dd 1323, 900, 900, 26, 0, 0
+    dd 2205, 4, 0, 40, 1, 0
+    dd 3087, 380, 130, 34, 0, 0
+sfxptr      times NSFX dd 0
+sfxend      times NSFX dd 0
 muted       dd 0
-sndend      dd 0
-sndprio     dd 0
 sc_ptr      dd 0
 sc_lfsr     dd 0
 sc_n        dd 0
 sc_phase    dd 0
 sc_amp      dd 0
-sfxptr      times NSFX dd 0
+eshot_t     dd 0
+opt_ret     dd 0
+vol_music   dd 5
+vol_sfx     dd 8
+aud_ok      dd 0
+aud_hwo     dd 0
+mgain       dd 0
+sgain       dd 0
+trk         dd -2
+seq_samp    dd 0
+seq_step    dd 0
+lead_ph     dd 0
+lead_inc    dd 0
+lead_env    dd 0
+bass_ph     dd 0
+bass_inc    dd 0
+drum_rem    dd 0
+drum_len    dd 1
+drum_cnt    dd 1
+drum_hold   dd 1
+drum_amp    dd 0
+lfsr        dd 0x2545F491
+voice_ptr   times 8 dd 0
+voice_end   times 8 dd 0
+wfx         dw 1, 1
+            dd 22050, 44100
+            dw 2, 16, 0
+whdr        times 5*32 db 0
+trkptr      dd trk_menu, trk_game
+drumlen     dd 1, 2400, 1800, 600
+drumhold    dd 1, 14, 4, 1
+drumamp     dd 0, 3200, 2600, 1500
+notetab     dd 194, 206, 218, 231, 245, 259, 275, 291, 309, 327, 346, 367, 389, 412, 436, 462, 490, 519, 550, 583, 617, 654, 693, 734, 778, 824, 873, 925, 980, 1038, 1100, 1165, 1234, 1308, 1386, 1468, 1555, 1648, 1746, 1849, 1959, 2076, 2199, 2330, 2469, 2615, 2771, 2936, 3110, 3295, 3491, 3699, 3919, 4152, 4399, 4660, 4937, 5231, 5542, 5872
+trk_menu:
+    dd 3300
+    db 57, 60, 64, 69, 64, 60, 57, 60, 64, 69, 72, 69, 64, 60, 57, 64
+    db 53, 57, 60, 65, 60, 57, 53, 57, 60, 65, 69, 65, 60, 57, 53, 60
+    db 60, 64, 67, 72, 67, 64, 60, 64, 67, 72, 76, 72, 67, 64, 60, 67
+    db 55, 59, 62, 67, 62, 59, 55, 59, 62, 67, 71, 67, 62, 59, 55, 62
+    db 45, 0, 0, 0, 0, 0, 0, 0, 45, 0, 0, 0, 52, 0, 0, 0
+    db 41, 0, 0, 0, 0, 0, 0, 0, 41, 0, 0, 0, 48, 0, 0, 0
+    db 48, 0, 0, 0, 0, 0, 0, 0, 48, 0, 0, 0, 55, 0, 0, 0
+    db 43, 0, 0, 0, 0, 0, 0, 0, 43, 0, 0, 0, 50, 0, 0, 0
+    db 1, 0, 0, 0, 3, 0, 0, 0, 1, 0, 0, 0, 3, 0, 0, 0
+    db 1, 0, 0, 0, 3, 0, 0, 0, 1, 0, 0, 0, 3, 0, 0, 0
+    db 1, 0, 0, 0, 3, 0, 0, 0, 1, 0, 0, 0, 3, 0, 0, 0
+    db 1, 0, 0, 0, 3, 0, 0, 0, 1, 0, 0, 0, 3, 0, 0, 0
+trk_game:
+    dd 2200
+    db 69, 0, 72, 0, 74, 0, 72, 69, 0, 0, 76, 0, 74, 72, 69, 0
+    db 69, 0, 72, 0, 74, 0, 76, 0, 79, 0, 76, 0, 74, 0, 72, 0
+    db 65, 0, 69, 0, 72, 0, 69, 65, 0, 0, 72, 0, 74, 72, 69, 0
+    db 67, 0, 71, 0, 74, 0, 71, 67, 0, 0, 74, 0, 79, 76, 74, 0
+    db 45, 0, 45, 0, 57, 0, 45, 0, 45, 0, 45, 0, 57, 0, 52, 0
+    db 45, 0, 45, 0, 57, 0, 45, 0, 45, 0, 45, 0, 57, 0, 52, 0
+    db 41, 0, 41, 0, 53, 0, 41, 0, 41, 0, 41, 0, 53, 0, 48, 0
+    db 43, 0, 43, 0, 55, 0, 43, 0, 43, 0, 43, 0, 55, 0, 50, 0
+    db 1, 0, 3, 0, 2, 0, 3, 0, 1, 0, 3, 0, 2, 0, 3, 0
+    db 1, 0, 3, 0, 2, 0, 3, 0, 1, 0, 3, 0, 2, 0, 3, 0
+    db 1, 0, 3, 0, 2, 0, 3, 0, 1, 0, 3, 0, 2, 0, 3, 0
+    db 1, 0, 3, 0, 2, 0, 3, 0, 1, 0, 3, 0, 2, 0, 3, 0
 s_scores    db 'SCORES', 0
+s_menu      db 'MENU', 0
+s_music     db 'MUSIC VOLUME', 0
+s_sfxvol    db 'SFX VOLUME', 0
 s_entername db 'ENTER NAME', 0
 s_nameh1    db 'TYPE 3 LETTERS OR DIGITS', 0
 s_nameh2    db 'BACKSPACE DELETE   ENTER START   ESC BACK', 0
@@ -4930,3 +5348,185 @@ font35:
 text_end:
 
 textsize equ text_end - text_start
+
+; ============================================================
+;  Resources: the application icon (RT_ICON 1 + RT_GROUP_ICON 1)
+; ============================================================
+section .rsrc follows=.text vstart=0x495000 align=512
+
+rsrc_start:
+r_root:
+    dd 0, 0
+    dw 0, 0
+    dw 0, 2
+    dd 3, 0x80000000 + (r_icon_dir - rsrc_start)
+    dd 14, 0x80000000 + (r_grp_dir - rsrc_start)
+r_icon_dir:
+    dd 0, 0
+    dw 0, 0
+    dw 0, 1
+    dd 1, 0x80000000 + (r_icon_lang - rsrc_start)
+r_icon_lang:
+    dd 0, 0
+    dw 0, 0
+    dw 0, 1
+    dd 0x0409, r_icon_entry - rsrc_start
+r_grp_dir:
+    dd 0, 0
+    dw 0, 0
+    dw 0, 1
+    dd 1, 0x80000000 + (r_grp_lang - rsrc_start)
+r_grp_lang:
+    dd 0, 0
+    dw 0, 0
+    dw 0, 1
+    dd 0x0409, r_grp_entry - rsrc_start
+r_icon_entry:
+    dd icon_img - ImageBase, icon_img_end - icon_img, 0, 0
+r_grp_entry:
+    dd grp_icon - ImageBase, grp_icon_end - grp_icon, 0, 0
+grp_icon:
+    dw 0, 1, 1
+    db 32, 32, 0, 0
+    dw 1, 32
+    dd icon_img_end - icon_img
+    dw 1
+grp_icon_end:
+    align 4, db 0
+icon_img:
+    dd 40, 32, 64
+    dw 1, 32
+    dd 0, 0, 0, 0, 0, 0
+    dd 0x00000000, 0x00000000, 0x00000000, 0xFF1E64D0, 0xFF1E64D0, 0xFF1E64D0, 0xFF1E64D0, 0xFF1E64D0
+    dd 0xFF1E64D0, 0xFF1E64D0, 0xFF1E64D0, 0xFF1E64D0, 0xFF1E64D0, 0xFF1E64D0, 0xFF1E64D0, 0xFF1E64D0
+    dd 0xFF1E64D0, 0xFF1E64D0, 0xFF1E64D0, 0xFF1E64D0, 0xFF1E64D0, 0xFF1E64D0, 0xFF1E64D0, 0xFF1E64D0
+    dd 0xFF1E64D0, 0xFF1E64D0, 0xFF1E64D0, 0xFF1E64D0, 0xFF1E64D0, 0x00000000, 0x00000000, 0x00000000
+    dd 0x00000000, 0x00000000, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18
+    dd 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18
+    dd 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18
+    dd 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0x00000000, 0x00000000
+    dd 0x00000000, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18
+    dd 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18
+    dd 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18
+    dd 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0x00000000
+    dd 0xFF1E64D0, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18
+    dd 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18
+    dd 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18
+    dd 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF1E64D0
+    dd 0xFF1E64D0, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18
+    dd 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFFFF7A18
+    dd 0xFFFF7A18, 0xFFFF7A18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18
+    dd 0xFF8FA6E8, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF1E64D0
+    dd 0xFF1E64D0, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18
+    dd 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFFFF7A18
+    dd 0xFFFF7A18, 0xFFFF7A18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18
+    dd 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF1E64D0
+    dd 0xFF1E64D0, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18
+    dd 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFFFF7A18
+    dd 0xFFFF7A18, 0xFFFF7A18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18
+    dd 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF1E64D0
+    dd 0xFF1E64D0, 0xFF070C18, 0xFF070C18, 0xFF8FA6E8, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18
+    dd 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF3AA7FF, 0xFF3AA7FF, 0xFF3AA7FF, 0xFF3AA7FF
+    dd 0xFF3AA7FF, 0xFF3AA7FF, 0xFF3AA7FF, 0xFF3AA7FF, 0xFF3AA7FF, 0xFF070C18, 0xFF070C18, 0xFF070C18
+    dd 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF1E64D0
+    dd 0xFF1E64D0, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF3AA7FF, 0xFF3AA7FF, 0xFF070C18, 0xFF070C18
+    dd 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF3AA7FF, 0xFF3AA7FF, 0xFF3AA7FF, 0xFF3AA7FF
+    dd 0xFF3AA7FF, 0xFF3AA7FF, 0xFF3AA7FF, 0xFF3AA7FF, 0xFF3AA7FF, 0xFF070C18, 0xFF070C18, 0xFF070C18
+    dd 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF3AA7FF, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF1E64D0
+    dd 0xFF1E64D0, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF3AA7FF, 0xFF3AA7FF, 0xFF070C18, 0xFF070C18
+    dd 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF3AA7FF, 0xFF3AA7FF, 0xFF3AA7FF, 0xFF3AA7FF
+    dd 0xFF3AA7FF, 0xFF3AA7FF, 0xFF3AA7FF, 0xFF3AA7FF, 0xFF3AA7FF, 0xFF070C18, 0xFF070C18, 0xFF070C18
+    dd 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF3AA7FF, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF1E64D0
+    dd 0xFF1E64D0, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFFFF3038, 0xFFFF3038, 0xFFFF3038, 0xFFFF3038
+    dd 0xFFFF3038, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF3AA7FF, 0xFF3AA7FF, 0xFF3AA7FF, 0xFF3AA7FF
+    dd 0xFF3AA7FF, 0xFF3AA7FF, 0xFF3AA7FF, 0xFF3AA7FF, 0xFF3AA7FF, 0xFF070C18, 0xFF070C18, 0xFF070C18
+    dd 0xFFFF3038, 0xFFFF3038, 0xFFFF3038, 0xFFFF3038, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF1E64D0
+    dd 0xFF1E64D0, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFFFF3038, 0xFFFF3038, 0xFFFF3038, 0xFFFF3038
+    dd 0xFFFF3038, 0xFF070C18, 0xFF3AA7FF, 0xFF3AA7FF, 0xFF3AA7FF, 0xFF3AA7FF, 0xFF3AA7FF, 0xFF3AA7FF
+    dd 0xFF3AA7FF, 0xFF3AA7FF, 0xFF3AA7FF, 0xFF3AA7FF, 0xFF3AA7FF, 0xFF3AA7FF, 0xFF070C18, 0xFF070C18
+    dd 0xFFFF3038, 0xFFFF3038, 0xFFFF3038, 0xFFFF3038, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF1E64D0
+    dd 0xFF1E64D0, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFFFF3038, 0xFFFF3038, 0xFFFF3038, 0xFFFF3038
+    dd 0xFFFF3038, 0xFF070C18, 0xFF3AA7FF, 0xFF3AA7FF, 0xFF3AA7FF, 0xFF3AA7FF, 0xFF3AA7FF, 0xFF3AA7FF
+    dd 0xFF3AA7FF, 0xFF3AA7FF, 0xFF3AA7FF, 0xFF3AA7FF, 0xFF3AA7FF, 0xFF3AA7FF, 0xFF070C18, 0xFF070C18
+    dd 0xFFFF3038, 0xFFFF3038, 0xFFFF3038, 0xFFFF3038, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF1E64D0
+    dd 0xFF1E64D0, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF3AA7FF, 0xFF3AA7FF, 0xFF3AA7FF, 0xFF3AA7FF
+    dd 0xFF3AA7FF, 0xFF070C18, 0xFF3AA7FF, 0xFF3AA7FF, 0xFF3AA7FF, 0xFF3AA7FF, 0xFF3AA7FF, 0xFFFF3038
+    dd 0xFFFF3038, 0xFFFF3038, 0xFF3AA7FF, 0xFF3AA7FF, 0xFF3AA7FF, 0xFF3AA7FF, 0xFF070C18, 0xFF070C18
+    dd 0xFF3AA7FF, 0xFF3AA7FF, 0xFF3AA7FF, 0xFF3AA7FF, 0xFF8FA6E8, 0xFF070C18, 0xFF070C18, 0xFF1E64D0
+    dd 0xFF1E64D0, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF3AA7FF, 0xFF3AA7FF
+    dd 0xFF3AA7FF, 0xFF3AA7FF, 0xFF3AA7FF, 0xFF3AA7FF, 0xFF3AA7FF, 0xFFFF3038, 0xFFFF3038, 0xFFFF3038
+    dd 0xFFFF3038, 0xFFFF3038, 0xFFFF3038, 0xFF3AA7FF, 0xFF3AA7FF, 0xFF3AA7FF, 0xFF3AA7FF, 0xFF3AA7FF
+    dd 0xFF3AA7FF, 0xFF3AA7FF, 0xFF3AA7FF, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF1E64D0
+    dd 0xFF1E64D0, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF3AA7FF, 0xFF3AA7FF
+    dd 0xFF3AA7FF, 0xFF3AA7FF, 0xFF3AA7FF, 0xFF3AA7FF, 0xFF3AA7FF, 0xFFFF3038, 0xFFFF3038, 0xFFFF3038
+    dd 0xFFFF3038, 0xFFFF3038, 0xFFFF3038, 0xFF3AA7FF, 0xFF3AA7FF, 0xFF3AA7FF, 0xFF3AA7FF, 0xFF3AA7FF
+    dd 0xFF3AA7FF, 0xFF3AA7FF, 0xFF3AA7FF, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF1E64D0
+    dd 0xFF1E64D0, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF3AA7FF, 0xFF3AA7FF
+    dd 0xFF3AA7FF, 0xFF070C18, 0xFF3AA7FF, 0xFF3AA7FF, 0xFF3AA7FF, 0xFFFF3038, 0xFFFF3038, 0xFFFF3038
+    dd 0xFFFF3038, 0xFFFF3038, 0xFFFF3038, 0xFF3AA7FF, 0xFF3AA7FF, 0xFF3AA7FF, 0xFF070C18, 0xFF070C18
+    dd 0xFF3AA7FF, 0xFF3AA7FF, 0xFF3AA7FF, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF1E64D0
+    dd 0xFF1E64D0, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF3AA7FF, 0xFF3AA7FF
+    dd 0xFF3AA7FF, 0xFF070C18, 0xFF3AA7FF, 0xFF3AA7FF, 0xFF3AA7FF, 0xFF3AA7FF, 0xFF3AA7FF, 0xFFFF3038
+    dd 0xFFFF3038, 0xFFFF3038, 0xFF3AA7FF, 0xFF3AA7FF, 0xFF3AA7FF, 0xFF3AA7FF, 0xFF070C18, 0xFF070C18
+    dd 0xFF3AA7FF, 0xFF3AA7FF, 0xFF3AA7FF, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF1E64D0
+    dd 0xFF1E64D0, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF3AA7FF, 0xFF3AA7FF
+    dd 0xFF3AA7FF, 0xFF070C18, 0xFF3AA7FF, 0xFF3AA7FF, 0xFF3AA7FF, 0xFF3AA7FF, 0xFF3AA7FF, 0xFFFF3038
+    dd 0xFFFF3038, 0xFFFF3038, 0xFF3AA7FF, 0xFF3AA7FF, 0xFF3AA7FF, 0xFF3AA7FF, 0xFF070C18, 0xFF070C18
+    dd 0xFF3AA7FF, 0xFF3AA7FF, 0xFF3AA7FF, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF1E64D0
+    dd 0xFF1E64D0, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFFFF3038, 0xFF070C18
+    dd 0xFF070C18, 0xFF070C18, 0xFF3AA7FF, 0xFF3AA7FF, 0xFF3AA7FF, 0xFF3AA7FF, 0xFF3AA7FF, 0xFF3AA7FF
+    dd 0xFF3AA7FF, 0xFF3AA7FF, 0xFF3AA7FF, 0xFF3AA7FF, 0xFF3AA7FF, 0xFF3AA7FF, 0xFF070C18, 0xFF070C18
+    dd 0xFF070C18, 0xFFFF3038, 0xFFFF3038, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF1E64D0
+    dd 0xFF1E64D0, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFFFF3038, 0xFF070C18
+    dd 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF3AA7FF, 0xFF3AA7FF, 0xFF3AA7FF, 0xFF3AA7FF
+    dd 0xFF3AA7FF, 0xFF3AA7FF, 0xFF3AA7FF, 0xFF3AA7FF, 0xFF3AA7FF, 0xFF070C18, 0xFF070C18, 0xFF070C18
+    dd 0xFF070C18, 0xFFFF3038, 0xFFFF3038, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF1E64D0
+    dd 0xFF1E64D0, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFFFF3038, 0xFF070C18
+    dd 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF3AA7FF, 0xFF3AA7FF, 0xFF3AA7FF, 0xFF3AA7FF
+    dd 0xFF3AA7FF, 0xFF3AA7FF, 0xFF3AA7FF, 0xFF3AA7FF, 0xFF3AA7FF, 0xFF070C18, 0xFF070C18, 0xFF070C18
+    dd 0xFF070C18, 0xFFFF3038, 0xFFFF3038, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF1E64D0
+    dd 0xFF1E64D0, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18
+    dd 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF3AA7FF, 0xFF3AA7FF, 0xFF3AA7FF, 0xFF3AA7FF
+    dd 0xFF3AA7FF, 0xFF3AA7FF, 0xFF3AA7FF, 0xFF3AA7FF, 0xFF3AA7FF, 0xFF070C18, 0xFF070C18, 0xFF070C18
+    dd 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF1E64D0
+    dd 0xFF1E64D0, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18
+    dd 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF3AA7FF, 0xFF3AA7FF, 0xFF3AA7FF
+    dd 0xFF3AA7FF, 0xFF3AA7FF, 0xFF3AA7FF, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18
+    dd 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF1E64D0
+    dd 0xFF1E64D0, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18
+    dd 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF3AA7FF, 0xFF3AA7FF, 0xFF3AA7FF
+    dd 0xFF3AA7FF, 0xFF3AA7FF, 0xFF3AA7FF, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18
+    dd 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF1E64D0
+    dd 0xFF1E64D0, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18
+    dd 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF3AA7FF, 0xFF3AA7FF, 0xFF3AA7FF
+    dd 0xFF3AA7FF, 0xFF3AA7FF, 0xFF3AA7FF, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18
+    dd 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF1E64D0
+    dd 0xFF1E64D0, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18
+    dd 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF3AA7FF
+    dd 0xFF3AA7FF, 0xFF3AA7FF, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18
+    dd 0xFF070C18, 0xFF070C18, 0xFF8FA6E8, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF1E64D0
+    dd 0xFF1E64D0, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18
+    dd 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF8FA6E8, 0xFF3AA7FF
+    dd 0xFF3AA7FF, 0xFF3AA7FF, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18
+    dd 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF1E64D0
+    dd 0xFF1E64D0, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF8FA6E8, 0xFF070C18, 0xFF070C18, 0xFF070C18
+    dd 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18
+    dd 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18
+    dd 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF1E64D0
+    dd 0x00000000, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18
+    dd 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18
+    dd 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18
+    dd 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0x00000000
+    dd 0x00000000, 0x00000000, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18
+    dd 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18
+    dd 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18
+    dd 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0xFF070C18, 0x00000000, 0x00000000
+    dd 0x00000000, 0x00000000, 0x00000000, 0xFF1E64D0, 0xFF1E64D0, 0xFF1E64D0, 0xFF1E64D0, 0xFF1E64D0
+    dd 0xFF1E64D0, 0xFF1E64D0, 0xFF1E64D0, 0xFF1E64D0, 0xFF1E64D0, 0xFF1E64D0, 0xFF1E64D0, 0xFF1E64D0
+    dd 0xFF1E64D0, 0xFF1E64D0, 0xFF1E64D0, 0xFF1E64D0, 0xFF1E64D0, 0xFF1E64D0, 0xFF1E64D0, 0xFF1E64D0
+    dd 0xFF1E64D0, 0xFF1E64D0, 0xFF1E64D0, 0xFF1E64D0, 0xFF1E64D0, 0x00000000, 0x00000000, 0x00000000
+    times 32 dd 0               ; AND mask (alpha channel does the work)
+icon_img_end:
+rsrc_data_end:
+    align 512, db 0
+rsrc_end:
