@@ -14,19 +14,22 @@
 
 bits 32
 
+%define OVERHEAT_ON 1           ; 1 = overheat cannon (heat gauge, lock-out, Coolant Leak rule); 0 removes it for good
+
 ImageBase   equ 0x400000
 W           equ 384
 H           equ 256
 PIX         equ 0x409000        ; pixel buffer, 384*256*4 bytes (zero-filled by loader)
-PBUL        equ 0x469000        ; pools: 32-byte entries
+PBUL        equ 0x46A800        ; 24 player bullets (the old slot at 0x469000 is free)        ; pools: 32-byte entries
 EBUL        equ 0x469100
 PART        equ 0x469200
 EXPL        equ 0x469E00
 DROP        equ 0x469F00
 STARS       equ 0x46A000        ; 64 stars, 16 bytes each
 BUNK        equ 0x46A400        ; 6 bunkers * 60 cells
+POPS        equ 0x46A700        ; 8 score pop-ups, 32 bytes each
 ALIEN       equ 0x46A600        ; 4 rows * 9 columns of hit points
-NPBUL       equ 8
+NPBUL       equ 24
 NEBUL       equ 8
 NPART       equ 96
 NEXPL       equ 8
@@ -859,7 +862,8 @@ addscore:                       ; EAX = base points (doubled by Score x2 and by 
 .a: cmp dword [rule], 7
     jne .b
     add eax, eax
-.b: add [score], eax
+.b: mov [last_pts], eax
+    add [score], eax
     ret
 
 ; ------------------------------------------------------------
@@ -1720,9 +1724,15 @@ over_step:
 ; ------------------------------------------------------------
 newgame:
     cld
-    mov edi, PBUL
-    mov ecx, 1008
+    mov edi, EBUL               ; enemy bullets, particles, explosions, drops
+    mov ecx, 944
     xor eax, eax
+    rep stosd
+    mov edi, PBUL
+    mov ecx, NPBUL*8
+    rep stosd
+    mov edi, POPS
+    mov ecx, 64
     rep stosd
     mov dword [score], 0
     mov dword [lives], 3
@@ -1776,7 +1786,7 @@ initformation:
     lea eax, [ebp+ebp*8]
     add eax, edi
     mov dl, 1
-    cmp byte [coltype+edi], 3
+    cmp byte [rowtype+ebp], 3   ; tanks (bottom row) take two hits
     jne .hp
     mov dl, 2
 .hp:
@@ -1853,7 +1863,18 @@ nextwave:
     inc dword [wcount]          ; every wave gets the next rule in the list
     mov eax, [wcount]
     sub eax, 2                  ; wave 2 gets rule 0, wave 3 rule 1, ...
+%if OVERHEAT_ON
     and eax, 7
+%else
+    xor edx, edx                ; without the overheat cannon the Coolant Leak rule (4) is skipped
+    mov ecx, 7
+    div ecx
+    mov eax, edx
+    cmp eax, 4
+    jb .rok
+    inc eax
+.rok:
+%endif
     mov [rule], eax
     call initformation
     mov eax, SFX_WAVE
@@ -1895,6 +1916,7 @@ play_step:
     call upd_drops
     call upd_part
     call upd_expl
+    call upd_pops
     call upd_formation
     call upd_boss
     call upd_ufo
@@ -1942,11 +1964,20 @@ player_step:
     jg .cooled
     mov dword [ohot], 0
 .cooled:
-    mov eax, 2
+    cmp dword [t_speed], 0      ; Speed power-up: the cannon cannot overheat while it lasts
+    je .heatok
+    mov dword [ohot], 0
+.heatok:
+    mov eax, 20                 ; speed in tenths of a pixel per frame
     cmp dword [t_speed], 0
     je .sp
-    mov eax, 4
+    mov eax, 24                 ; Speed power-up: 2.4 px/frame (it used to be 4.0)
 .sp:
+    add eax, [mvacc]
+    xor edx, edx
+    mov ecx, 10
+    div ecx
+    mov [mvacc], edx            ; the remainder carries over to the next frame
     mov dword [bank], 0
     movzx ebx, byte [kdown+K_LEFT]
     movzx ecx, byte [kdown+K_RIGHT]
@@ -2003,10 +2034,17 @@ player_step:
     mov edx, 2
     call addpbul
 .cd:
-    mov dword [pcool], 14
+    mov dword [pcool], 14       ; normal fire rate
+    cmp dword [t_speed], 0
+    je .nsp
+    mov dword [pcool], 7        ; Speed power-up: 100% faster fire rate
+.nsp:
     mov dword [flash], 6
     mov eax, SFX_SHOOT
     call playsfx
+%if OVERHEAT_ON
+    cmp dword [t_speed], 0      ; shots add no heat during Speed
+    jne .nofire
     mov eax, 12                 ; every shot adds heat
     cmp dword [t_spread], 0
     je .g1
@@ -2029,6 +2067,7 @@ player_step:
     mov eax, 8
     xor edi, edi
     call burst
+%endif
 .nofire:
     cmp byte [kpress+K_UP], 0   ; power-up slot selection
     je .nu
@@ -2586,7 +2625,7 @@ alien_hit:                      ; EBP=row EDI=col
     dec byte [ALIEN+eax]
     jnz .dmg
     dec dword [acnt]
-    movzx edx, byte [coltype+edi]
+    movzx edx, byte [rowtype+ebp]
     mov eax, [pts+edx*4]
     call addscore
     mov eax, SFX_KILL
@@ -2599,6 +2638,8 @@ alien_hit:                      ; EBP=row EDI=col
     add ecx, 8
     mov [ah_x], ebx
     mov [ah_y], ecx
+    mov edx, ecx
+    call addpop
     xor eax, eax
     call addexpl
     mov eax, 6
@@ -2709,6 +2750,8 @@ pb_boss:
     mov ebx, [bossx]
     add ebx, 12
     mov ecx, 48
+    mov edx, ecx
+    call addpop
     mov eax, 2
     call addexpl
     mov eax, 20
@@ -2752,6 +2795,8 @@ pb_ufo:
     mov ebx, [ux]
     add ebx, 12
     mov ecx, 30
+    mov edx, ecx
+    call addpop
     mov eax, 1
     call addexpl
     mov eax, 10
@@ -2847,6 +2892,9 @@ col_drops:
 .bonus:
     mov eax, 100                ; already at full lives: points instead
     call addscore
+    mov ebx, [esi+4]
+    mov edx, [esi+8]
+    call addpop
     jmp .full
 .notlife:
     cmp eax, 4                  ; score x2: used at once
@@ -2872,6 +2920,105 @@ col_drops:
     dec ecx
     jnz .l
 .r: ret
+
+
+; ------------------------------------------------------------
+;  score pop-ups: every award shows "+N" for half a second where it was earned
+; ------------------------------------------------------------
+addpop:                         ; EBX = x, EDX = y (centre), [last_pts] = points just awarded
+    pushad
+    push ebx
+    push edx
+    mov esi, POPS
+    mov ecx, 8
+    call findfree
+    pop edx
+    pop ebx
+    test eax, eax
+    jz .r
+    mov dword [eax], 1
+    mov [eax+4], ebx
+    mov [eax+8], edx
+    mov ecx, [last_pts]
+    mov [eax+20], ecx
+    mov dword [eax+24], 30      ; 30 frames at 60 per second
+.r: popad
+    ret
+
+upd_pops:
+    mov esi, POPS
+    mov ecx, 8
+.l: cmp dword [esi], 0
+    je .n
+    dec dword [esi+24]
+    jg .n
+    mov dword [esi], 0
+.n: add esi, 32
+    dec ecx
+    jnz .l
+    ret
+
+draw_pops:
+    mov ebp, POPS
+    mov edi, 8
+.l: cmp dword [ebp], 0
+    je .n
+    mov eax, [ebp+20]
+    mov ecx, 2                  ; digits needed
+    cmp eax, 100
+    jb .d
+    inc ecx
+    cmp eax, 1000
+    jb .d
+    inc ecx
+.d: mov [pp_len], ecx
+    call numstr
+    mov byte [popbuf], '+'
+    xor edx, edx
+.c: mov al, [numbuf+edx]
+    mov [popbuf+1+edx], al
+    inc edx
+    test al, al
+    jnz .c
+    mov eax, [pp_len]
+    inc eax
+    shl eax, 3
+    sub eax, 2                  ; text width at scale 2
+    shr eax, 1
+    mov ebx, [ebp+4]
+    sub ebx, eax
+    cmp ebx, 2
+    jge .xl
+    mov ebx, 2
+.xl:
+    cmp ebx, W-40
+    jle .xr
+    mov ebx, W-40
+.xr:
+    mov eax, 30                 ; drifts upwards as it ages
+    sub eax, [ebp+24]
+    xor edx, edx
+    mov ecx, 3
+    div ecx
+    mov ecx, [ebp+8]
+    sub ecx, 5
+    sub ecx, eax
+    mov esi, popbuf
+    mov edx, 2
+    push ebx
+    push ecx
+    inc ebx                     ; dark shadow so it reads on any background
+    inc ecx
+    mov eax, 0x0A0F1E
+    call drawtext
+    pop ecx
+    pop ebx
+    mov eax, C_PUX2
+    call drawtext
+.n: add ebp, 32
+    dec edi
+    jnz .l
+    ret
 
 
 ; ============================================================
@@ -2983,10 +3130,13 @@ draw_play:
     call draw_ufo
     call draw_drops
     call draw_ship
+%if OVERHEAT_ON
     call draw_heat
+%endif
     call draw_bullets
     call draw_parts
     call draw_expls
+    call draw_pops
     call draw_shield
     call draw_hud
     call draw_rule
@@ -3048,7 +3198,7 @@ draw_aliens:
     add ebx, [fx]
     imul ecx, ebp, 18
     add ecx, [fy]
-    movzx esi, byte [coltype+edi]
+    movzx esi, byte [rowtype+ebp]
     mov eax, [encol+esi*4]
     cmp esi, 3
     jne .col
@@ -4122,7 +4272,7 @@ bankseq     dd 0, 1, 0, 2
 encol       dd C_SQUID, C_CRAB, C_OCTO, C_TANK
 pts         dd 10, 20, 30, 40
 ufovals     dd 50, 100, 150, 300
-coltype     db 0, 0, 0, 1, 1, 2, 2, 3, 3
+rowtype     db 0, 1, 2, 3               ; squid, crab, octopus, tank: one type per row
 expdur      db 8, 12, 20
 pu_data     dd pu_shield, pu_speed, pu_spread, pu_life, pu_star
 pu_col      dd C_PUSHIELD, C_PUSPEED, C_PUSPREAD, C_PULIFE, C_PUX2
@@ -4161,6 +4311,9 @@ sfxtab:                         ; samples (22050 Hz), freq (noise: hold), freq 2
     dd 2205, 4, 0, 40, 1, 0
     dd 3087, 380, 130, 34, 0, 0
 sfxptr      times NSFX dd 0
+last_pts    dd 0
+pp_len      dd 0
+popbuf      times 12 db 0
 sfxend      times NSFX dd 0
 muted       dd 0
 sc_ptr      dd 0
@@ -4333,6 +4486,7 @@ pn_w dd 0
 pn_h dd 0
 heat dd 0
 ohot dd 0
+mvacc dd 0
 wcount dd 1
 rule dd 0
 rbanner dd 0
@@ -5332,7 +5486,7 @@ shield_ring:   ; shield bubble 32x32
 ; 3x5 font, ASCII 32..90, one word per glyph (15 bits, row-major, MSB = top-left pixel)
 font35:
     dw 0x0000, 0x2482, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000
-    dw 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x01C0, 0x0002, 0x12A4
+    dw 0x0000, 0x0000, 0x0000, 0x05D0, 0x0000, 0x01C0, 0x0002, 0x12A4
     dw 0x7B6F, 0x2C97, 0x73E7, 0x73CF, 0x5BC9, 0x79CF, 0x79EF, 0x7249
     dw 0x7BEF, 0x7BCF, 0x0410, 0x0000, 0x1511, 0x0000, 0x4454, 0x0000
     dw 0x0000, 0x2BED, 0x6BAE, 0x3923, 0x6B6E, 0x79A7, 0x79A4, 0x396B
