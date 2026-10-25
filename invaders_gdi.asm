@@ -1106,6 +1106,9 @@ mix_fill:                       ; EDI = WAVEHDR: fill its buffer with 512 mixed 
     jne .pick
 .game:
     mov eax, 1
+    cmp dword [bon], 0          ; boss music while a boss is alive
+    je .pick
+    mov eax, 2
     jmp .pick
 .none:
     mov eax, -1
@@ -1813,6 +1816,8 @@ initformation:
     mov dword [anim], 0
     mov dword [bon], 0
     mov dword [bflash], 0
+    mov dword [bbanner], 0
+    mov dword [bshield], 0
     mov dword [rbanner], 0
     cmp dword [rule], 0         ; wave rules only start on wave 2
     jl .norb
@@ -1846,6 +1851,16 @@ initformation:
     add eax, 10
     mov [bhp], eax
     mov dword [bcool], 90
+    mov eax, [stage]            ; a different boss each stage, then the cycle repeats
+    dec eax
+    and eax, 3
+    mov [btype], eax
+    mov dword [bshield], 0
+    mov dword [bshtimer], 120
+    mov dword [bburst], 0
+    mov dword [bbanner], 180
+    mov eax, [bhp]
+    mov [bmax], eax
 .r: ret
 
 nextwave:
@@ -2099,8 +2114,20 @@ player_step:
     cmp byte [kpress+K_Z], 0    ; use the selected power-up
     je .done
     mov ebx, [sel]
+    mov ecx, 3                  ; empty slot: move on to the next one that has a power-up
+.find:
     cmp dword [inv+ebx*4], 0
-    je .done
+    jne .found
+    inc ebx
+    cmp ebx, 3
+    jb .nw
+    xor ebx, ebx
+.nw:
+    dec ecx
+    jnz .find
+    jmp .done                   ; nothing to use at all
+.found:
+    mov [sel], ebx              ; the selection follows, so the HUD shows what was used
     cmp ebx, 3
     jne .go
     cmp dword [lives], 5
@@ -2335,22 +2362,36 @@ upd_boss:
     cmp dword [bflash], 0
     je .a
     dec dword [bflash]
-.a: cmp dword [bon], 0
+.a: cmp dword [bbanner], 0
+    je .b
+    dec dword [bbanner]
+.b: cmp dword [bon], 0
     je .r
     mov eax, [bdir]
+    cmp dword [btype], 1        ; the Sniper moves twice as fast
+    jne .spd
+    add eax, eax
+.spd:
     add [bossx], eax
     cmp dword [bdir], 0
     jl .left
     cmp dword [bossx], 354
-    jl .fire
+    jl .mv
     neg dword [bdir]
-    jmp .fire
+    jmp .mv
 .left:
     cmp dword [bossx], 6
-    jg .fire
+    jg .mv
     neg dword [bdir]
-.fire:
-    dec dword [bcool]
+.mv:
+    mov eax, [btype]
+    cmp eax, 1
+    je .sniper
+    cmp eax, 2
+    je .warden
+    cmp eax, 3
+    je .spiral
+    dec dword [bcool]           ; BARRAGE (gold): a wide fan every 70 frames
     jg .r
     mov dword [bcool], 70
     mov ebx, [bossx]
@@ -2362,6 +2403,78 @@ upd_boss:
     call addebul
     mov edx, 1
     call addebul
+    ret
+.sniper:                        ; SNIPER (red): one shot aimed at the ship every 38 frames
+    dec dword [bcool]
+    jg .r
+    mov dword [bcool], 38
+    mov ebx, [bossx]
+    add ebx, 12
+    mov eax, [px]
+    add eax, 8
+    sub eax, ebx
+    cdq
+    mov esi, 62
+    idiv esi
+    cmp eax, 3
+    jle .s1
+    mov eax, 3
+.s1:
+    cmp eax, -3
+    jge .s2
+    mov eax, -3
+.s2:
+    mov edx, eax
+    mov ecx, 56
+    call addebul
+    ret
+.warden:                        ; WARDEN (cyan): shield up 150 frames, down 180; two straight shots
+    dec dword [bshtimer]
+    jg .wf
+    cmp dword [bshield], 0
+    jne .woff
+    mov dword [bshield], 1
+    mov dword [bshtimer], 150
+    jmp .wf
+.woff:
+    mov dword [bshield], 0
+    mov dword [bshtimer], 180
+.wf:
+    dec dword [bcool]
+    jg .r
+    mov dword [bcool], 55
+    mov ebx, [bossx]
+    add ebx, 4
+    mov ecx, 56
+    xor edx, edx
+    call addebul
+    add ebx, 16
+    call addebul
+    ret
+.spiral:                        ; SPIRAL (green): rests, then sweeps ten shots from left to right
+    cmp dword [bburst], 0
+    jg .burst
+    dec dword [bcool]
+    jg .r
+    mov dword [bburst], 40
+    ret
+.burst:
+    dec dword [bburst]
+    mov eax, [bburst]
+    test al, 3
+    jnz .r
+    shr eax, 2
+    xor edx, edx
+    mov ecx, 5
+    div ecx
+    sub edx, 2
+    mov ebx, [bossx]
+    add ebx, 12
+    mov ecx, 56
+    call addebul
+    cmp dword [bburst], 0
+    jg .r
+    mov dword [bcool], 70
 .r: ret
 
 upd_ufo:
@@ -2732,6 +2845,13 @@ pb_boss:
     sub eax, 35
     cmp eax, 25
     jae .no
+    cmp dword [bshield], 0      ; the Warden's shield soaks up shots
+    je .dmg
+    mov eax, SFX_MENU
+    call playsfx
+    mov eax, 1
+    ret
+.dmg:
     mov dword [bflash], 4
     mov eax, SFX_HIT
     call playsfx
@@ -3140,6 +3260,7 @@ draw_play:
     call draw_shield
     call draw_hud
     call draw_rule
+    call draw_bossban
     cmp dword [wclear], 0
     je .r
     mov esi, s_waveclear
@@ -3230,18 +3351,69 @@ draw_boss:
     and eax, 1
     shl eax, 6
     mov edx, eax
+    mov ebp, [btype]
     lea esi, [boss_gold0+edx]
-    mov eax, C_GOLD
+    mov eax, [bosscol+ebp*4]
     cmp dword [bflash], 0
     je .g
     mov eax, 0xFFFFFF
 .g: call blit24
     lea esi, [boss_orange0+edx]
-    mov eax, C_ORANGE
+    mov eax, [bosstrim+ebp*4]
     call blit24
     mov esi, boss_eye
-    mov eax, C_PRED
+    mov eax, [bosseye+ebp*4]
     call blit24
+    mov ecx, 37                 ; health bar above the boss
+    mov edx, 24
+    mov esi, 2
+    mov eax, 0x1E2E52
+    call fillrect
+    mov eax, [bhp]
+    imul eax, eax, 24
+    xor edx, edx
+    div dword [bmax]
+    cmp eax, 1
+    jge .w
+    mov eax, 1
+.w: mov edx, eax
+    mov eax, [bosscol+ebp*4]
+    mov esi, 2
+    call fillrect
+    cmp dword [bshield], 0
+    je .r
+    sub ebx, 4                  ; shield bubble around the Warden
+    mov ecx, 32
+    mov esi, shield_ring
+    mov eax, [bosscol+ebp*4]
+    call blit32
+.r: ret
+
+draw_bossban:                   ; "WARNING" and the boss name when a boss arrives
+    cmp dword [bbanner], 0
+    je .r
+    cmp dword [bon], 0
+    je .r
+    test byte [frame], 8
+    jnz .name
+    mov esi, s_warning
+    mov ecx, 146
+    mov edx, 2
+    mov eax, C_CRAB
+    call drawtextc
+.name:
+    mov eax, [btype]
+    mov esi, [bossnames+eax*4]
+    mov ecx, 164
+    mov edx, 2
+    mov eax, [bosscol+eax*4]
+    call drawtextc
+    mov eax, [btype]
+    mov esi, [bossdesc+eax*4]
+    mov ecx, 184
+    mov edx, 1
+    mov eax, C_PWHITE
+    call drawtextc
 .r: ret
 
 draw_ufo:
@@ -4314,6 +4486,26 @@ sfxptr      times NSFX dd 0
 last_pts    dd 0
 pp_len      dd 0
 popbuf      times 12 db 0
+btype       dd 0
+bshield     dd 0
+bshtimer    dd 0
+bburst      dd 0
+bmax        dd 1
+bbanner     dd 0
+bosscol     dd C_GOLD, 0xFF3B3B, 0x21D9FF, 0x72F542
+bosstrim    dd C_ORANGE, 0x9A1028, 0x1670C0, 0x2A8A2A
+bosseye     dd C_PRED, 0xFFE044, 0xFFFFFF, 0xFF2FD6
+bossnames   dd s_bn0, s_bn1, s_bn2, s_bn3
+bossdesc    dd s_bd0, s_bd1, s_bd2, s_bd3
+s_warning   db 'WARNING', 0
+s_bn0       db 'BOSS BARRAGE', 0
+s_bn1       db 'BOSS SNIPER', 0
+s_bn2       db 'BOSS WARDEN', 0
+s_bn3       db 'BOSS SPIRAL', 0
+s_bd0       db 'FIRES WIDE FANS OF SHOTS', 0
+s_bd1       db 'FAST AND AIMS AT YOU', 0
+s_bd2       db 'ITS SHIELD BLOCKS YOUR SHOTS', 0
+s_bd3       db 'SWEEPING SPIRAL BURSTS', 0
 sfxend      times NSFX dd 0
 muted       dd 0
 sc_ptr      dd 0
@@ -4349,7 +4541,21 @@ wfx         dw 1, 1
             dd 22050, 44100
             dw 2, 16, 0
 whdr        times 5*32 db 0
-trkptr      dd trk_menu, trk_game
+trk_boss:
+    dd 1800
+    db 69, 0, 69, 72, 0, 69, 0, 76, 0, 75, 76, 0, 72, 0, 69, 0
+    db 70, 0, 70, 73, 0, 70, 0, 77, 0, 76, 77, 0, 73, 0, 70, 0
+    db 65, 0, 65, 69, 0, 65, 0, 72, 0, 71, 72, 0, 69, 0, 65, 0
+    db 64, 0, 64, 68, 0, 64, 0, 71, 0, 70, 71, 0, 76, 75, 71, 0
+    db 45, 45, 57, 45, 45, 45, 57, 45, 45, 45, 57, 45, 45, 45, 57, 45
+    db 46, 46, 58, 46, 46, 46, 58, 46, 46, 46, 58, 46, 46, 46, 58, 46
+    db 41, 41, 53, 41, 41, 41, 53, 41, 41, 41, 53, 41, 41, 41, 53, 41
+    db 40, 40, 52, 40, 40, 40, 52, 40, 40, 40, 52, 40, 40, 40, 52, 40
+    db 1, 0, 3, 0, 2, 0, 1, 0, 1, 0, 3, 0, 2, 0, 3, 0
+    db 1, 0, 3, 0, 2, 0, 1, 0, 1, 0, 3, 0, 2, 0, 3, 0
+    db 1, 0, 3, 0, 2, 0, 1, 0, 1, 0, 3, 0, 2, 0, 3, 0
+    db 1, 0, 3, 0, 2, 0, 1, 0, 1, 0, 3, 0, 2, 0, 3, 0
+trkptr      dd trk_menu, trk_game, trk_boss
 drumlen     dd 1, 2400, 1800, 600
 drumhold    dd 1, 14, 4, 1
 drumamp     dd 0, 3200, 2600, 1500
