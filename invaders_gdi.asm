@@ -1101,7 +1101,10 @@ mix_fill:                       ; EDI = WAVEHDR: fill its buffer with 512 mixed 
     cmp edx, 4
     je .none
     cmp edx, 1
+    je .optq
+    cmp edx, 7
     jne .pick
+.optq:
     cmp dword [opt_ret], 3
     jne .pick
 .game:
@@ -1458,7 +1461,9 @@ gamestep:
     je over_step
     cmp eax, 5
     je name_step
-    jmp score_step
+    cmp eax, 6
+    je score_step
+    jmp tut_step
 
 initstars:
     xor ebp, ebp
@@ -1598,7 +1603,7 @@ menu_step:
 opt_step:
     cmp byte [kpress+K_ESC], 0
     jne .back
-    mov ecx, 4
+    mov ecx, 5
     call menu_nav
     mov edx, eax                ; activated (SPACE / ENTER)
     mov eax, [menusel]
@@ -1608,12 +1613,20 @@ opt_step:
     je .music
     cmp eax, 2
     je .sfx
+    cmp eax, 3
+    je .tut
     test edx, edx               ; BACK
     jz .r
 .back:
     mov eax, [opt_ret]
     mov [scene], eax
     mov dword [menusel], 2      ; OPTIONS is the third item of both the main and pause menus
+    ret
+.tut:
+    test edx, edx
+    jz .r
+    mov dword [tutpage], 0
+    mov dword [scene], 7
     ret
 .ship:
     cmp byte [kpress+K_LEFT], 0
@@ -3141,6 +3154,130 @@ draw_pops:
     ret
 
 
+; ------------------------------------------------------------
+;  tutorial (scene 7): two pages opened from OPTIONS
+; ------------------------------------------------------------
+tut_step:
+    cmp byte [kpress+K_ESC], 0
+    jne .back
+    cmp byte [kpress+K_ENTER], 0
+    jne .back
+    cmp byte [kpress+K_LEFT], 0
+    jne .flip
+    cmp byte [kpress+K_RIGHT], 0
+    jne .flip
+    cmp byte [kpress+K_SPACE], 0
+    je .r
+.flip:
+    xor dword [tutpage], 1
+    mov eax, SFX_MENU
+    call playsfx
+.r: ret
+.back:
+    mov dword [scene], 1
+    mov dword [menusel], 3      ; back on the TUTORIAL item
+    ret
+
+drawpairs:                      ; ESI = table of (key, text) pointer pairs, ECX = rows, EBX = first y
+    pushad
+    mov [dm_y], ebx
+    mov ebp, esi
+    mov edi, ecx
+.l: mov esi, [ebp]
+    mov ebx, 24
+    mov ecx, [dm_y]
+    mov edx, 1
+    mov eax, C_PUX2
+    call drawtext
+    mov esi, [ebp+4]
+    mov ebx, 130
+    mov eax, C_PWHITE
+    call drawtext
+    add ebp, 8
+    add dword [dm_y], 14
+    dec edi
+    jnz .l
+    popad
+    ret
+
+drawlines:                      ; ESI = table of string pointers, ECX = rows, EBX = first y; centred
+    pushad
+    mov [dm_y], ebx
+    mov ebp, esi
+    mov edi, ecx
+.l: mov esi, [ebp]
+    mov ecx, [dm_y]
+    mov edx, 1
+    mov eax, 0xA8C8FF
+    call drawtextc
+    add ebp, 4
+    add dword [dm_y], 14
+    dec edi
+    jnz .l
+    popad
+    ret
+
+draw_tutorial:
+    cmp dword [tutpage], 0
+    jne .p2
+    mov esi, s_tut1
+    mov ecx, 12
+    mov edx, 3
+    mov eax, C_PWHITE
+    call drawtextc
+    mov esi, tut_pairs
+    mov ecx, 6
+    mov ebx, 46
+    call drawpairs
+    mov esi, tut_goal
+    mov ecx, 4
+    mov ebx, 148
+    call drawlines
+    mov esi, s_pg1
+    jmp .foot
+.p2:
+    mov esi, s_tut2
+    mov ecx, 12
+    mov edx, 3
+    mov eax, C_PWHITE
+    call drawtextc
+    xor ebp, ebp
+.pu:
+    mov eax, ebp                ; power-up icon, name and what it does
+    mov ebx, 24
+    imul ecx, ebp, 22
+    add ecx, 42
+    call drawpu
+    mov esi, [pu_names+ebp*4]
+    mov ebx, 50
+    add ecx, 4
+    mov edx, 1
+    mov eax, C_PUX2
+    call drawtext
+    mov esi, [pu_desc+ebp*4]
+    mov ebx, 96
+    mov eax, C_PWHITE
+    call drawtext
+    inc ebp
+    cmp ebp, 5
+    jb .pu
+    mov esi, tut_lines2
+    mov ecx, 3
+    mov ebx, 160
+    call drawlines
+    mov esi, s_pg2
+.foot:
+    mov ecx, 226
+    mov edx, 1
+    mov eax, C_PBUL
+    call drawtextc
+    mov esi, s_tutkeys
+    mov ecx, 244
+    mov eax, 0x6FA8FF
+    call drawtextc
+    ret
+
+
 ; ============================================================
 ;  Rendering
 ; ============================================================
@@ -3160,6 +3297,8 @@ render:
     je draw_name
     cmp eax, 6
     je draw_scores
+    cmp eax, 7
+    je draw_tutorial
     call draw_play
     mov eax, [scene]
     cmp eax, 3
@@ -4079,11 +4218,19 @@ draw_options:
     mov edi, [vol_sfx]
     mov ecx, 182
     call drawbar
-    mov esi, s_back
-    mov ecx, 208
+    mov esi, s_tutorial
+    mov ecx, 200
     mov edx, 2
     mov eax, 0x4A6FB5
     cmp dword [menusel], 3
+    jne .tt
+    mov eax, C_PWHITE
+.tt: call drawtextc
+    mov esi, s_back
+    mov ecx, 220
+    mov edx, 2
+    mov eax, 0x4A6FB5
+    cmp dword [menusel], 4
     jne .b
     mov eax, C_PWHITE
 .b: call drawtextc
@@ -4405,6 +4552,47 @@ s_final     db 'SCORE', 0
 s_waveclear db 'WAVE CLEAR', 0
 s_shipcolor db 'SHIP COLOR', 0
 s_back      db 'BACK', 0
+tutpage     dd 0
+s_tutorial  db 'TUTORIAL', 0
+s_tut1      db 'HOW TO PLAY', 0
+s_tut2      db 'POWER-UPS', 0
+s_pg1       db '1/2', 0
+s_pg2       db '2/2', 0
+s_tutkeys   db 'LEFT RIGHT PAGE   ESC BACK', 0
+tut_pairs   dd tx_k1, tx_d1, tx_k2, tx_d2, tx_k3, tx_d3, tx_k4, tx_d4, tx_k5, tx_d5, tx_k6, tx_d6
+tx_k1  db 'ARROWS OR A D', 0
+tx_d1  db 'MOVE YOUR SHIP', 0
+tx_k2  db 'SPACE', 0
+tx_d2  db 'SHOOT', 0
+tx_k3  db 'Z', 0
+tx_d3  db 'USE THE SELECTED POWER-UP', 0
+tx_k4  db 'UP DOWN OR 1-3', 0
+tx_d4  db 'PICK A POWER-UP SLOT', 0
+tx_k5  db 'P OR ESC', 0
+tx_d5  db 'PAUSE', 0
+tx_k6  db 'M', 0
+tx_d6  db 'MUTE THE SOUND', 0
+tut_goal    dd tx_g1, tx_g2, tx_g3, tx_g4
+tx_g1  db 'DESTROY EVERY INVADER BEFORE THEY REACH THE BUNKERS', 0
+tx_g2  db 'A BOSS ARRIVES ON WAVE 3 OF EACH STAGE', 0
+tx_g3  db 'FROM WAVE 2 A NEW RULE CHANGES EACH WAVE', 0
+tx_g4  db 'YOUR TOP 5 SCORES ARE SAVED WITH YOUR NAME', 0
+pu_names    dd tx_n1, tx_n2, tx_n3, tx_n4, tx_n5
+tx_n1  db 'SHIELD', 0
+tx_n2  db 'SPEED', 0
+tx_n3  db 'SPREAD', 0
+tx_n4  db 'HEART', 0
+tx_n5  db 'X2', 0
+pu_desc     dd tx_e1, tx_e2, tx_e3, tx_e4, tx_e5
+tx_e1  db 'BLOCKS ALL HITS FOR A WHILE', 0
+tx_e2  db 'FAST SHIP AND FIRE - NO OVERHEAT', 0
+tx_e3  db 'THREE SHOTS THAT PASS THROUGH BUNKERS', 0
+tx_e4  db 'EXTRA LIFE - USED AT ONCE', 0
+tx_e5  db 'DOUBLE POINTS - USED AT ONCE', 0
+tut_lines2  dd tx_t1, tx_t2, tx_t3
+tx_t1  db 'SHIELD SPEED AND SPREAD ARE STORED: PRESS Z TO USE ONE', 0
+tx_t2  db 'HOLD FIRE TOO LONG AND THE CANNON OVERHEATS', 0
+tx_t3  db 'WATCH THE HEAT GAUGE UNDER YOUR SHIP', 0
 s_blue      db '< BLUE >', 0
 s_green     db '< GREEN >', 0
 s_purple    db '< PURPLE >', 0
